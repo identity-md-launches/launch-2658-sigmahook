@@ -34,7 +34,7 @@ abstract contract Fixture is Test {
         alice = makeAddr("alice");
         bob = makeAddr("bob");
         owner = makeAddr("owner");
-        manager = IPoolManager(address(new PoolManager(owner)));
+        manager = IPoolManager(deployCode("PoolManager.sol:PoolManager", abi.encode(owner)));
         token = new SigmaToken();
         weth = new MockERC20("Wrapped Ether", "WETH");
         hook = _deployHook(address(token));
@@ -53,18 +53,27 @@ abstract contract Fixture is Test {
 
     function _deployHook(address launchToken) internal returns (SigmaHook deployed) {
         bytes memory initCode =
-            bytes.concat(type(SigmaHook).creationCode, abi.encode(manager, owner, launchToken, address(this)));
+            bytes.concat(vm.getCode("SigmaHook.sol:SigmaHook"), abi.encode(manager, owner, launchToken, address(this)));
         bytes32 hash = keccak256(initCode);
         for (uint256 i; i < 200_000; ++i) {
             bytes32 salt = bytes32(i);
             address predicted =
                 address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, hash)))));
             if (!HookFlags.matches(predicted, HookFlags.SIGMA) || predicted.code.length != 0) continue;
-            deployed = new SigmaHook{salt: salt}(manager, owner, launchToken, address(this));
+            deployed = _createHook(initCode, salt);
             assertEq(address(deployed), predicted);
             return deployed;
         }
         revert("salt search exhausted");
+    }
+
+    function _createHook(bytes memory initCode, bytes32 salt) internal returns (SigmaHook deployed) {
+        address target;
+        assembly ("memory-safe") {
+            target := create2(0, add(initCode, 32), mload(initCode), salt)
+        }
+        require(target != address(0), "hook deployment failed");
+        return SigmaHook(payable(target));
     }
 
     function _fundAndApprove(address who) internal {

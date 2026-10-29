@@ -14,7 +14,6 @@ import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.s
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
-import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -23,13 +22,14 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BandMath} from "./libraries/BandMath.sol";
-import {VaultMath} from "./libraries/VaultMath.sol";
+import {SigmaMath} from "./SigmaMath.sol";
+import {PermanentTokenLock} from "./PermanentTokenLock.sol";
+import {SigmaVault} from "./SigmaVault.sol";
 
-/// @notice Single-pool vault with execution-tick SMA bands and automatic fee compounding.
+/// @notice Single-pool basket backing the ERC-4626 SigmaVault, with permissionless keeper compounding.
 /// @dev Shares represent only this hook's position and idle assets, never other LP positions.
 contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCallback {
     using StateLibrary for IPoolManager;
-    using TransientStateLibrary for IPoolManager;
     using SafeERC20 for IERC20;
 
     error InvalidAddress();
@@ -46,20 +46,34 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
     error UnsupportedToken();
     error UnexpectedUnlock();
     error OwnershipRequired();
-    error InsufficientClaims();
+    error RebalanceTooSoon();
+    error WithinThreshold();
+    error NoExternalShares();
+    error NoPendingInvestment();
+    error AlreadyConfigured();
 
     uint256 public constant REBALANCE_INTERVAL = 30 minutes;
     uint256 public constant MINIMUM_SHARES = 1_000;
     /// @notice A rebalance sells surplus inventory only when it exceeds this share of vault value.
     uint256 public constant REBALANCE_SWAP_DEADBAND_BPS = 100;
-    /// @notice A balancing trade stops at the band edge, and never more than this many ticks away.
-    int24 public constant REBALANCE_SWAP_MAX_TICKS = 300;
+    uint256 public constant BURN_BPS = 2_000;
+    uint256 public constant KEEPER_BPS = 100;
     uint24 public constant LP_FEE = 12_500;
     int24 public constant TICK_SPACING = 60;
     bytes32 public constant POSITION_SALT = keccak256("SigmaHook.vault");
 
     address public immutable launchToken;
     address public immutable factory;
+    address public immutable burnSink;
+    SigmaVault public immutable vault;
+    SigmaMath public immutable math;
+    address public WETH;
+    uint256 public accountedNative;
+    uint256 public burnReserve0;
+    uint256 public burnReserve1;
+    uint256 public keeperReserve0;
+    uint256 public keeperReserve1;
+    bool public investmentPending;
     PoolKey private _key;
     PoolId public poolId;
     bool public initialized;
@@ -76,11 +90,14 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         Harvest,
         Invest,
         Withdraw,
-        Emergency
+        Emergency,
+        InitialDeposit,
+        Rebalance,
+        Retry
     }
 
     event PoolBound(PoolId indexed id, address currency0, address currency1, int24 launchTick);
-    event SampleRecorded(uint8 indexed index, int24 tick, int24 mean, uint256 sigma);
+    event SampleRecorded(uint8 indexed index, int24 tick);
     event Rebalanced(int24 lower, int24 upper, uint128 oldLiquidity, uint128 newLiquidity);
     event BandRefreshed(int24 lower, int24 upper);
     event InventoryBalanced(bool zeroForOne, uint256 amountIn, int128 delta0, int128 delta1);
@@ -88,10 +105,18 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
     event Deposited(address indexed caller, address indexed receiver, uint256 shares, uint256 amount0, uint256 amount1);
     event Withdrawn(address indexed caller, address indexed receiver, uint256 shares, uint256 amount0, uint256 amount1);
     event EmergencyActivated(uint256 amount0, uint256 amount1);
+    event FeesSplit(uint256 fee0, uint256 fee1, uint256 burn0, uint256 burn1, uint256 keeper0, uint256 keeper1);
+    event KeeperPaid(address indexed keeper, uint256 amount0, uint256 amount1);
+    event LaunchDisposed(uint256 amount, bool zeroAddressTransfer);
+    event BuybackDeferred(uint256 amount0, uint256 amount1);
+    event BuybackExecuted(uint256 pairedSpent, uint256 launchBought);
+    event InvestmentDeferred(uint256 amount0, uint256 amount1);
+    event WETHConfigured(address indexed weth);
+    event StrayETHRescued(address indexed receiver, uint256 amount);
 
     constructor(IPoolManager manager_, address owner_, address launchToken_, address factory_)
         BaseHook(manager_)
-        ERC20("SigmaHook Vault Share", "svSHK")
+        ERC20("SigmaHook Basket Receipt", "sSHK")
         Ownable(owner_)
     {
         if (address(manager_) == address(0) || launchToken_ == address(0) || factory_ == address(0)) {
@@ -99,6 +124,9 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         }
         launchToken = launchToken_;
         factory = factory_;
+        burnSink = address(new PermanentTokenLock());
+        vault = new SigmaVault(IERC20(address(this)));
+        math = new SigmaMath();
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory permissions) {
@@ -112,18 +140,18 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
 
     /// @notice Whole-tick view of the feed: mean rounded to nearest, sigma floored.
     function statistics() public view returns (int24 mean, uint256 sigma) {
-        return BandMath.statistics(ticks);
+        return math.statistics(ticks);
     }
 
     /// @notice The exact feed moments in eighths of a tick: sum = 8 × mean, sigma8 = floor(8 × sigma).
     function moments() public view returns (int256 sum, uint256 sigma8) {
-        return BandMath.moments(ticks);
+        return math.moments(ticks);
     }
 
     function proposedBands() external view returns (int24 lower, int24 upper) {
         _requireInitialized();
         (int256 sum, uint256 sigma8) = moments();
-        return BandMath.bands(sum, sigma8, _key.tickSpacing);
+        return math.bands(sum, sigma8, _key.tickSpacing);
     }
 
     /// @notice Principal, uncollected fees, raw dust, and ERC-6909 claims in pool currency order.
@@ -147,8 +175,8 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
     /// @notice Deposit a proportional basket. Unused ERC-20 budgets are never pulled, on the first
     /// deposit included: only what the minted liquidity costs leaves the caller.
     /// @dev For native currency0 send exactly amount0Max; unused ETH is refunded to the caller.
-    /// While the vault holds no position the band is refreshed from the feed before quoting, so a
-    /// first deposit after the price has moved invests around the current price.
+    /// The first deposit refreshes the band from the feed before quoting. Later deposits cannot
+    /// change a pending range or bypass the keeper cooldown.
     function deposit(uint256 amount0Max, uint256 amount1Max, uint256 minShares, address receiver, uint256 deadline)
         external
         payable
@@ -161,26 +189,34 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         if (minShares == 0) revert InvalidAmount();
         if (msg.value != (_key.currency0.isAddressZero() ? amount0Max : 0)) revert UnexpectedNativeValue();
 
-        // Existing holders own all fees earned before the deposit.
+        accountedNative += msg.value;
+
+        // Existing holders own all net fees earned before the deposit.
         if (liquidity != 0) {
             _unlock(Action.Harvest, 0, 0);
-        } else {
+        } else if (totalSupply() == 0) {
             (int256 sum, uint256 sigma8) = moments();
-            (tickLower, tickUpper) = BandMath.bands(sum, sigma8, _key.tickSpacing);
+            (tickLower, tickUpper) = math.bands(sum, sigma8, _key.tickSpacing);
             emit BandRefreshed(tickLower, tickUpper);
         }
         (shares, amount0, amount1) = _quoteDeposit(amount0Max, amount1Max, msg.value);
         if (shares == 0 || shares < minShares) revert Slippage();
-        if (totalSupply() == 0) _mint(address(this), MINIMUM_SHARES);
-        _mint(receiver, shares);
-
-        // Tokens are pulled exclusively from the entry point's msg.sender.
         _pull(_key.currency0, amount0);
         _pull(_key.currency1, amount1);
-        if (_key.currency0.isAddressZero() && msg.value > amount0) {
-            _key.currency0.transfer(msg.sender, msg.value - amount0);
+        if (totalSupply() == 0) {
+            // The callback sizes against only this depositor's budgets. Preexisting donations
+            // cannot increase the amount invested on their behalf or contaminate the refund.
+            (shares, amount0, amount1) =
+                abi.decode(_unlock(Action.InitialDeposit, shares + MINIMUM_SHARES, 0), (uint256, uint256, uint256));
+            if (shares < minShares) revert Slippage();
+            _mint(address(this), MINIMUM_SHARES);
+        } else {
+            if (_key.currency0.isAddressZero() && msg.value > amount0) {
+                _transferCurrency(_key.currency0, msg.sender, msg.value - amount0);
+            }
+            _unlock(Action.Invest, 0, 0);
         }
-        _unlock(Action.Invest, 0, 0);
+        _mint(receiver, shares);
         emit Deposited(msg.sender, receiver, shares, amount0, amount1);
     }
 
@@ -250,7 +286,7 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         for (uint256 i; i < 8; ++i) {
             ticks[i] = tick;
         }
-        (tickLower, tickUpper) = BandMath.bands(int256(tick) * BandMath.SAMPLES, 0, key.tickSpacing);
+        (tickLower, tickUpper) = math.bands(int256(tick) * BandMath.SAMPLES, 0, key.tickSpacing);
         lastRebalance = block.timestamp;
         emit PoolBound(poolId, Currency.unwrap(key.currency0), Currency.unwrap(key.currency1), tick);
         return IHooks.afterInitialize.selector;
@@ -268,47 +304,78 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         uint8 index = nextSample;
         ticks[index] = tick;
         nextSample = (index + 1) % 8;
-        (int256 sum, uint256 sigma8) = moments();
-        {
-            (int24 mean, uint256 sigma) = BandMath.rounded(sum, sigma8);
-            emit SampleRecorded(index, tick, mean, sigma);
-        }
-        // Only external holders justify a cycle: the locked minimum shares alone never trigger one.
-        if (
-            !emergencyMode && totalSupply() > MINIMUM_SHARES && block.timestamp >= lastRebalance + REBALANCE_INTERVAL
-                && BandMath.deviates(tick, sum, sigma8)
-        ) {
-            // The manager is already unlocked by the swap router. Never nest unlock().
-            lastRebalance = block.timestamp;
-            // A router that synced an ERC-20 before its swap is mid-payment: a second sync would
-            // absorb its transfer and reset its settlement, so this cycle pays from claims only and
-            // leaves raw dust for a later one.
-            bool useRaw = poolManager.getSyncedCurrency().isAddressZero();
-            uint128 oldLiquidity = liquidity;
-            if (oldLiquidity != 0) _changeLiquidity(-int256(uint256(oldLiquidity)), useRaw);
-            (tickLower, tickUpper) = BandMath.bands(sum, sigma8, key.tickSpacing);
-            _balanceInventory(useRaw);
-            _invest(useRaw);
-            emit Rebalanced(tickLower, tickUpper, oldLiquidity, liquidity);
-        }
+        emit SampleRecorded(index, tick);
         return (IHooks.afterSwap.selector, 0);
+    }
+
+    /// @notice Move capital only when both the cooldown and strict 1.5-sigma trigger hold.
+    function flashRebalance(PoolKey calldata key) external nonReentrant {
+        _requireLive();
+        _checkKey(key);
+        if (block.timestamp < lastRebalance + REBALANCE_INTERVAL) revert RebalanceTooSoon();
+        (, int24 tick,,) = poolManager.getSlot0(poolId);
+        (int256 sum, uint256 sigma8) = moments();
+        if (!BandMath.deviates(tick, sum, sigma8)) revert WithinThreshold();
+        if (totalSupply() <= MINIMUM_SHARES) revert NoExternalShares();
+        lastRebalance = block.timestamp;
+        _unlock(Action.Rebalance, 0, 0);
+    }
+
+    function lastRebalanceTimestamp() external view returns (uint256) {
+        return lastRebalance;
+    }
+
+    /// @notice Retry idle inventory in the already selected range, without a bounty or range change.
+    function retryInvestment(PoolKey calldata key) external nonReentrant {
+        _requireLive();
+        _checkKey(key);
+        if (!investmentPending) revert NoPendingInvestment();
+        _unlock(Action.Retry, 0, 0);
+    }
+
+    /// @notice Optional, one-time source authorization for wrapped ETH. Native pools do not need it.
+    function setWETH(address weth) external onlyOwner {
+        if (WETH != address(0)) revert AlreadyConfigured();
+        if (weth == address(0) || weth.code.length == 0) revert InvalidAddress();
+        WETH = weth;
+        emit WETHConfigured(weth);
+    }
+
+    /// @notice Recover only ETH outside the native pool's accounted balance, including forced ETH.
+    function rescueStrayETH() external onlyOwner nonReentrant {
+        uint256 amount = address(this).balance - accountedNative;
+        address receiver = owner();
+        Currency.wrap(address(0)).transfer(receiver, amount);
+        emit StrayETHRescued(receiver, amount);
+    }
+
+    function _checkKey(PoolKey calldata key) private view {
+        if (PoolId.unwrap(key.toId()) != PoolId.unwrap(poolId)) revert InvalidPool();
     }
 
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory result) {
         if (!_expectUnlock) revert UnexpectedUnlock();
         _expectUnlock = false;
-        (Action action, uint256 shares, uint256 supply) = abi.decode(data, (Action, uint256, uint256));
+        (Action action, uint256 shares, uint256 supply, address caller, uint256 nativeBudget) =
+            abi.decode(data, (Action, uint256, uint256, address, uint256));
         if (action == Action.Harvest) {
             _harvest();
+        } else if (action == Action.InitialDeposit) {
+            result = _initialDeposit(uint128(shares), caller, nativeBudget);
         } else if (action == Action.Invest) {
-            _invest(true);
+            _invest();
+        } else if (action == Action.Rebalance) {
+            _rebalance(caller);
+        } else if (action == Action.Retry) {
+            if (_capacity() != 0) _balanceInventory();
+            _invest();
         } else if (action == Action.Withdraw) {
             _harvest();
-            uint256 amount0 = FullMath.mulDiv(_idle(_key.currency0), shares, supply);
-            uint256 amount1 = FullMath.mulDiv(_idle(_key.currency1), shares, supply);
+            uint256 amount0 = FullMath.mulDiv(_available(_key.currency0), shares, supply);
+            uint256 amount1 = FullMath.mulDiv(_available(_key.currency1), shares, supply);
             uint128 removed = uint128(FullMath.mulDiv(liquidity, shares, supply));
             if (removed != 0) {
-                BalanceDelta delta = _changeLiquidity(-int256(uint256(removed)), true);
+                BalanceDelta delta = _changeLiquidity(-int256(uint256(removed)));
                 amount0 += uint128(delta.amount0());
                 amount1 += uint128(delta.amount1());
             }
@@ -316,95 +383,203 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
             _makeRaw(_key.currency1, amount1);
             result = abi.encode(amount0, amount1);
         } else {
-            if (liquidity != 0) _changeLiquidity(-int256(uint256(liquidity)), true);
+            if (liquidity != 0) _changeLiquidity(-int256(uint256(liquidity)));
             _makeRaw(_key.currency0, _idle(_key.currency0));
             _makeRaw(_key.currency1, _idle(_key.currency1));
+            // Terminal mode cancels unexecuted fee allocations back to LPs. No keeper job remains.
+            burnReserve0 = 0;
+            burnReserve1 = 0;
+            keeperReserve0 = 0;
+            keeperReserve1 = 0;
+            investmentPending = false;
         }
     }
 
     function _unlock(Action action, uint256 shares, uint256 supply) private returns (bytes memory) {
         _expectUnlock = true;
-        return poolManager.unlock(abi.encode(action, shares, supply));
+        return poolManager.unlock(abi.encode(action, shares, supply, msg.sender, msg.value));
+    }
+
+    function _initialDeposit(uint128 added, address caller, uint256 nativeBudget) private returns (bytes memory) {
+        (uint160 price,,,) = poolManager.getSlot0(poolId);
+        (uint256 budget0, uint256 budget1) = math.amounts(price, tickLower, tickUpper, added, true);
+        if (added <= MINIMUM_SHARES) revert Slippage();
+        BalanceDelta delta = _changeLiquidity(int256(uint256(added)));
+        uint256 amount0Consumed = uint256(-int256(delta.amount0()));
+        uint256 amount1Consumed = uint256(-int256(delta.amount1()));
+        // Price shares from the manager's actual rounded debits, never the user's maximum budget.
+        uint256 paidLiquidity =
+            math.liquidityForAmounts(price, tickLower, tickUpper, amount0Consumed, amount1Consumed, added);
+        if (paidLiquidity <= MINIMUM_SHARES) revert Slippage();
+        uint256 refund0 = (_key.currency0.isAddressZero() ? nativeBudget : budget0) - amount0Consumed;
+        uint256 refund1 = budget1 - amount1Consumed;
+        // Refund in this same unlock; no unused first-deposit budget can back genesis shares.
+        if (refund0 != 0) _transferCurrency(_key.currency0, caller, refund0);
+        if (refund1 != 0) _transferCurrency(_key.currency1, caller, refund1);
+        return abi.encode(paidLiquidity - MINIMUM_SHARES, amount0Consumed, amount1Consumed);
+    }
+
+    function _rebalance(address keeper) private {
+        uint128 oldLiquidity = liquidity;
+        if (oldLiquidity != 0) _changeLiquidity(-int256(uint256(oldLiquidity)));
+        (int256 sum, uint256 sigma8) = moments();
+        (tickLower, tickUpper) = math.bands(sum, sigma8, _key.tickSpacing);
+        _distributeFees(keeper);
+        if (_capacity() != 0) _balanceInventory();
+        _invest();
+        emit Rebalanced(tickLower, tickUpper, oldLiquidity, liquidity);
     }
 
     function _harvest() private {
-        if (liquidity != 0) _changeLiquidity(0, true);
+        if (liquidity != 0) _changeLiquidity(0);
     }
 
-    function _changeLiquidity(int256 change, bool useRaw) private returns (BalanceDelta delta) {
+    function _changeLiquidity(int256 change) private returns (BalanceDelta delta) {
         if (change < 0) liquidity -= uint128(uint256(-change));
         else liquidity += uint128(uint256(change));
         BalanceDelta fees;
         (delta, fees) =
             poolManager.modifyLiquidity(_key, ModifyLiquidityParams(tickLower, tickUpper, change, POSITION_SALT), "");
         // callerDelta ALREADY includes fees; never add feesAccrued a second time.
-        _settle(_key.currency0, delta.amount0(), useRaw);
-        _settle(_key.currency1, delta.amount1(), useRaw);
+        _settle(_key.currency0, delta.amount0());
+        _settle(_key.currency1, delta.amount1());
         if (fees.amount0() != 0 || fees.amount1() != 0) {
-            emit FeesCollected(uint128(fees.amount0()), uint128(fees.amount1()));
+            uint256 fee0 = uint128(fees.amount0());
+            uint256 fee1 = uint128(fees.amount1());
+            uint256 burn0 = fee0 * BURN_BPS / 10_000;
+            uint256 burn1 = fee1 * BURN_BPS / 10_000;
+            uint256 keeper0 = fee0 * KEEPER_BPS / 10_000;
+            uint256 keeper1 = fee1 * KEEPER_BPS / 10_000;
+            burnReserve0 += burn0;
+            burnReserve1 += burn1;
+            keeperReserve0 += keeper0;
+            keeperReserve1 += keeper1;
+            emit FeesCollected(fee0, fee1);
+            emit FeesSplit(fee0, fee1, burn0, burn1, keeper0, keeper1);
         }
     }
 
-    function _invest(bool useRaw) private {
+    function _invest() private {
+        uint128 added;
+        uint128 capacity = _capacity();
+        // A bounded number of ratio corrections adapts to price impact; there is no 300-tick cap.
+        for (uint256 attempt; attempt < 3 && capacity != 0; ++attempt) {
+            (uint160 price,,,) = poolManager.getSlot0(poolId);
+            added = math.liquidityForAmounts(
+                price, tickLower, tickUpper, _budget(_key.currency0), _budget(_key.currency1), capacity
+            );
+            if (added != 0) {
+                _changeLiquidity(int256(uint256(added)));
+                investmentPending = false;
+                return;
+            }
+            if (!_balanceInventory()) break;
+        }
+        // Persistent claims/raw balances remain redeemable. Transient storage cannot hold funds
+        // across transactions. Retrying never pays another bounty or bypasses the range gates.
+        investmentPending = liquidity == 0 && (_available(_key.currency0) != 0 || _available(_key.currency1) != 0);
+        if (investmentPending) emit InvestmentDeferred(_available(_key.currency0), _available(_key.currency1));
+    }
+
+    /// @dev Trade as deeply as the selected statistical range permits, stopping one tick inside
+    /// its edge. If no other LP can fill it, retain inventory for permissionless retry/withdrawal.
+    function _balanceInventory() private returns (bool traded) {
+        if (poolManager.getLiquidity(poolId) == 0) return false;
         (uint160 price,,,) = poolManager.getSlot0(poolId);
-        uint128 added = VaultMath.liquidityForAmounts(
-            price,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            _budget(_key.currency0, useRaw),
-            _budget(_key.currency1, useRaw),
-            _capacity()
+        (bool zeroForOne, uint256 amountIn) = math.rebalanceTrade(
+            price, tickLower, tickUpper, _budget(_key.currency0), _budget(_key.currency1), REBALANCE_SWAP_DEADBAND_BPS
         );
-        if (added != 0) _changeLiquidity(int256(uint256(added)), useRaw);
-    }
-
-    /// @dev Sell the surplus side into the pool so the inventory matches the band's ratio at the
-    /// current price (see VaultMath.rebalanceTrade). The price limit is the band edge the trade
-    /// moves towards, capped at REBALANCE_SWAP_MAX_TICKS, so the vault never trades outside the
-    /// range it is about to supply; whatever stays unsold waits for the next cycle.
-    function _balanceInventory(bool useRaw) private {
-        // With nothing to trade against a swap would only displace the price.
-        if (poolManager.getLiquidity(poolId) == 0) return;
-        (uint160 price, int24 tick,,) = poolManager.getSlot0(poolId);
-        (bool zeroForOne, uint256 amountIn) = VaultMath.rebalanceTrade(
-            price,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            _budget(_key.currency0, useRaw),
-            _budget(_key.currency1, useRaw),
-            REBALANCE_SWAP_DEADBAND_BPS
-        );
-        if (amountIn == 0) return;
-        uint160 limit = VaultMath.tradeLimit(zeroForOne, tick, tickLower, tickUpper, REBALANCE_SWAP_MAX_TICKS);
-        if (zeroForOne ? limit >= price : limit <= price) return;
-        // The manager skips this hook's own callbacks for a swap it sends itself.
+        if (amountIn == 0) return false;
+        uint160 limit = _routeLimit(zeroForOne);
+        if (zeroForOne ? limit >= price : limit <= price) return false;
         BalanceDelta delta = poolManager.swap(_key, SwapParams(zeroForOne, -int256(amountIn), limit), "");
-        _settle(_key.currency0, delta.amount0(), useRaw);
-        _settle(_key.currency1, delta.amount1(), useRaw);
+        _settle(_key.currency0, delta.amount0());
+        _settle(_key.currency1, delta.amount1());
         emit InventoryBalanced(zeroForOne, amountIn, delta.amount0(), delta.amount1());
+        return delta.amount0() != 0 || delta.amount1() != 0;
     }
 
-    /// @dev Spendable inventory: claims, plus raw balance when the hook may settle it, bounded to int128.
-    function _budget(Currency currency, bool useRaw) private view returns (uint256 amount) {
+    function _routeLimit(bool zeroForOne) private view returns (uint160) {
+        return math.priceAtTick(zeroForOne ? tickLower + 1 : tickUpper - 1);
+    }
+
+    function _distributeFees(address keeper) private {
+        bool launchIs0 = Currency.unwrap(_key.currency0) == launchToken;
+        uint256 input = launchIs0 ? burnReserve1 : burnReserve0;
+        if (input != 0) {
+            bool zeroForOne = !launchIs0;
+            (uint160 price,,,) = poolManager.getSlot0(poolId);
+            uint160 limit = _routeLimit(zeroForOne);
+            if (poolManager.getLiquidity(poolId) != 0 && (zeroForOne ? limit < price : limit > price)) {
+                uint256 amountIn = Math.min(input, uint256(uint128(type(int128).max)));
+                BalanceDelta delta = poolManager.swap(_key, SwapParams(zeroForOne, -int256(amountIn), limit), "");
+                _settle(_key.currency0, delta.amount0());
+                _settle(_key.currency1, delta.amount1());
+                if (launchIs0) {
+                    burnReserve1 -= uint256(-int256(delta.amount1()));
+                    burnReserve0 += uint128(delta.amount0());
+                    emit BuybackExecuted(uint256(-int256(delta.amount1())), uint128(delta.amount0()));
+                } else {
+                    burnReserve0 -= uint256(-int256(delta.amount0()));
+                    burnReserve1 += uint128(delta.amount1());
+                    emit BuybackExecuted(uint256(-int256(delta.amount0())), uint128(delta.amount1()));
+                }
+            }
+        }
+        uint256 launchAmount = launchIs0 ? burnReserve0 : burnReserve1;
+        if (launchAmount != 0) {
+            if (launchIs0) burnReserve0 = 0;
+            else burnReserve1 = 0;
+            _makeRaw(Currency.wrap(launchToken), launchAmount);
+            _disposeLaunch(launchAmount);
+        }
+        if (burnReserve0 != 0 || burnReserve1 != 0) emit BuybackDeferred(burnReserve0, burnReserve1);
+        uint256 keeper0 = keeperReserve0;
+        uint256 keeper1 = keeperReserve1;
+        keeperReserve0 = 0;
+        keeperReserve1 = 0;
+        _makeRaw(_key.currency0, keeper0);
+        _makeRaw(_key.currency1, keeper1);
+        _pay(keeper, keeper0, keeper1);
+        emit KeeperPaid(keeper, keeper0, keeper1);
+    }
+
+    function _disposeLaunch(uint256 amount) private {
+        IERC20 token = IERC20(launchToken);
+        uint256 beforeBalance = token.balanceOf(address(this));
+        (bool success, bytes memory result) = launchToken.call(abi.encodeCall(IERC20.transfer, (address(0), amount)));
+        bool sentToZero = success && (result.length == 0 || (result.length == 32 && abi.decode(result, (bool))));
+        if (!sentToZero) token.safeTransfer(burnSink, amount);
+        if (beforeBalance - token.balanceOf(address(this)) != amount) revert UnsupportedToken();
+        emit LaunchDisposed(amount, sentToZero);
+    }
+
+    /// @dev Spendable inventory excludes fee liabilities and is bounded to int128.
+    function _budget(Currency currency) private view returns (uint256 amount) {
         amount = poolManager.balanceOf(address(this), currency.toId());
-        if (useRaw) amount += currency.balanceOfSelf();
-        return Math.min(amount, uint256(uint128(type(int128).max)));
+        amount += _rawBalance(currency);
+        uint256 reserved = _reserved(currency);
+        return Math.min(amount > reserved ? amount - reserved : 0, uint256(uint128(type(int128).max)));
     }
 
     /// @dev Match v4's per-tick cap, including other LPs sharing either boundary.
     function _capacity() private view returns (uint128) {
+        return _capacityFor(tickLower, tickUpper);
+    }
+
+    function _capacityFor(int24 lower, int24 upper) private view returns (uint128) {
         int256 minIndex = BandMath.floor(TickMath.MIN_TICK, _key.tickSpacing) / _key.tickSpacing;
         int256 maxIndex = int256(TickMath.MAX_TICK) / _key.tickSpacing;
         uint128 maxPerTick = uint128(type(uint128).max / uint256(maxIndex - minIndex + 1));
-        (uint128 grossLower,) = poolManager.getTickLiquidity(poolId, tickLower);
-        (uint128 grossUpper,) = poolManager.getTickLiquidity(poolId, tickUpper);
+        (uint128 grossLower,) = poolManager.getTickLiquidity(poolId, lower);
+        (uint128 grossUpper,) = poolManager.getTickLiquidity(poolId, upper);
         uint128 gross = grossLower > grossUpper ? grossLower : grossUpper;
         return gross >= maxPerTick ? 0 : maxPerTick - gross;
     }
 
-    /// @dev Positive deltas become claims so afterSwap never takes unsettled router inputs.
-    /// Negative deltas consume claims first and then, when `useRaw`, settle from the raw balance.
-    function _settle(Currency currency, int128 delta, bool useRaw) private {
+    /// @dev All deltas settle in this hook's own unlock. Credits become claims; debts consume
+    /// those claims before any raw balance. Router swaps only record observations.
+    function _settle(Currency currency, int128 delta) private {
         if (delta > 0) {
             poolManager.mint(address(this), currency.toId(), uint128(delta));
         } else if (delta < 0) {
@@ -413,10 +588,10 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
             if (claims != 0) poolManager.burn(address(this), currency.toId(), claims);
             debt -= claims;
             if (debt != 0) {
-                if (!useRaw) revert InsufficientClaims();
                 poolManager.sync(currency);
                 uint256 paid;
                 if (currency.isAddressZero()) {
+                    accountedNative -= debt;
                     paid = poolManager.settle{value: debt}();
                 } else {
                     currency.transfer(address(poolManager), debt);
@@ -428,7 +603,7 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
     }
 
     function _makeRaw(Currency currency, uint256 amount) private {
-        uint256 raw = currency.balanceOfSelf();
+        uint256 raw = _rawBalance(currency);
         if (amount > raw) {
             uint256 redeem = amount - raw;
             poolManager.burn(address(this), currency.toId(), redeem);
@@ -437,32 +612,40 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
     }
 
     function _idle(Currency currency) private view returns (uint256) {
-        return currency.balanceOfSelf() + poolManager.balanceOf(address(this), currency.toId());
+        return _rawBalance(currency) + poolManager.balanceOf(address(this), currency.toId());
+    }
+
+    function _rawBalance(Currency currency) private view returns (uint256) {
+        return currency.isAddressZero() ? accountedNative : currency.balanceOfSelf();
+    }
+
+    function _reserved(Currency currency) private view returns (uint256) {
+        return currency == _key.currency0 ? burnReserve0 + keeperReserve0 : burnReserve1 + keeperReserve1;
+    }
+
+    function _available(Currency currency) private view returns (uint256) {
+        return _idle(currency) - _reserved(currency);
+    }
+
+    function _netFee(uint256 fee) private pure returns (uint256) {
+        return fee - fee * BURN_BPS / 10_000 - fee * KEEPER_BPS / 10_000;
+    }
+
+    /// @notice Amounts excluded from LP NAV for the next buyback and keeper payment.
+    function feeLiabilities() external view returns (uint256 amount0, uint256 amount1) {
+        (,, uint256 fee0, uint256 fee1) = math.positionAssets(address(this), false);
+        amount0 = burnReserve0 + keeperReserve0 + fee0 - _netFee(fee0);
+        amount1 = burnReserve1 + keeperReserve1 + fee1 - _netFee(fee1);
     }
 
     function _assets(bool roundUp) private view returns (uint256 amount0, uint256 amount1) {
-        amount0 = _idle(_key.currency0);
-        amount1 = _idle(_key.currency1);
-        if (liquidity != 0) {
-            (uint160 price,,,) = poolManager.getSlot0(poolId);
-            (uint256 principal0, uint256 principal1) = VaultMath.amounts(
-                price,
-                TickMath.getSqrtPriceAtTick(tickLower),
-                TickMath.getSqrtPriceAtTick(tickUpper),
-                liquidity,
-                roundUp
-            );
-            (, uint256 last0, uint256 last1) =
-                poolManager.getPositionInfo(poolId, address(this), tickLower, tickUpper, POSITION_SALT);
-            (uint256 growth0, uint256 growth1) = poolManager.getFeeGrowthInside(poolId, tickLower, tickUpper);
-            // Fee growth wraps modulo 2^256 in v4.
-            unchecked {
-                growth0 -= last0;
-                growth1 -= last1;
-            }
-            amount0 += principal0 + FullMath.mulDiv(growth0, liquidity, 1 << 128);
-            amount1 += principal1 + FullMath.mulDiv(growth1, liquidity, 1 << 128);
-        }
+        if (emergencyMode) return (_rawBalance(_key.currency0), _rawBalance(_key.currency1));
+        amount0 = _available(_key.currency0);
+        amount1 = _available(_key.currency1);
+        (uint256 principal0, uint256 principal1, uint256 fee0, uint256 fee1) =
+            math.positionAssets(address(this), roundUp);
+        amount0 += principal0 + _netFee(fee0);
+        amount1 += principal1 + _netFee(fee1);
     }
 
     function _quoteDeposit(uint256 max0, uint256 max1, uint256 incomingNative)
@@ -474,20 +657,13 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         if (max0 > uint128(type(int128).max) || max1 > uint128(type(int128).max)) revert InvalidAmount();
         uint256 supply = totalSupply();
         if (supply == 0) {
+            (int256 sum, uint256 sigma8) = moments();
+            (int24 lower, int24 upper) = math.bands(sum, sigma8, _key.tickSpacing);
             (uint160 price,,,) = poolManager.getSlot0(poolId);
-            uint128 initial = VaultMath.liquidityForAmounts(
-                price,
-                TickMath.getSqrtPriceAtTick(tickLower),
-                TickMath.getSqrtPriceAtTick(tickUpper),
-                max0,
-                max1,
-                _capacity()
-            );
+            uint128 initial = math.liquidityForAmounts(price, lower, upper, max0, max1, _capacityFor(lower, upper));
             if (initial <= MINIMUM_SHARES) return (0, 0, 0);
             // Pull only what the minted liquidity costs, never the unused side of the budget.
-            (amount0, amount1) = VaultMath.amounts(
-                price, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), initial, true
-            );
+            (amount0, amount1) = math.amounts(price, lower, upper, initial, true);
             return (initial - MINIMUM_SHARES, amount0, amount1);
         }
         (uint256 assets0, uint256 assets1) = _assets(true);
@@ -513,16 +689,21 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         _checkReceiver(receiver);
         if (shares == 0) revert InvalidAmount();
         uint256 supply = totalSupply();
-        amount0 = FullMath.mulDiv(_key.currency0.balanceOfSelf(), shares, supply);
-        amount1 = FullMath.mulDiv(_key.currency1.balanceOfSelf(), shares, supply);
+        amount0 = FullMath.mulDiv(_rawBalance(_key.currency0), shares, supply);
+        amount1 = FullMath.mulDiv(_rawBalance(_key.currency1), shares, supply);
         _burn(msg.sender, shares);
         _pay(receiver, amount0, amount1);
         emit Withdrawn(msg.sender, receiver, shares, amount0, amount1);
     }
 
     function _pay(address receiver, uint256 amount0, uint256 amount1) private {
-        if (amount0 != 0) _key.currency0.transfer(receiver, amount0);
-        if (amount1 != 0) _key.currency1.transfer(receiver, amount1);
+        if (amount0 != 0) _transferCurrency(_key.currency0, receiver, amount0);
+        if (amount1 != 0) _transferCurrency(_key.currency1, receiver, amount1);
+    }
+
+    function _transferCurrency(Currency currency, address receiver, uint256 amount) private {
+        if (currency.isAddressZero()) accountedNative -= amount;
+        currency.transfer(receiver, amount);
     }
 
     function _checkCurrency(Currency currency) private view {
@@ -542,11 +723,11 @@ contract SigmaHook is BaseHook, ERC20, Ownable2Step, ReentrancyGuard, IUnlockCal
         if (emergencyMode) revert EmergencyActive();
     }
 
-    /// @dev Only the manager paying out native currency0 may send ETH here; stray ETH would be
-    /// unaccounted on an ERC-20 pair and has no recovery path.
+    /// @dev Only trusted settlement/unwrap sources may send ETH. Forced ETH stays outside NAV.
     receive() external payable {
-        if (msg.sender != address(poolManager) || !initialized || !_key.currency0.isAddressZero()) {
-            revert UnexpectedNativeValue();
+        if (msg.sender != address(poolManager) && msg.sender != WETH) revert UnexpectedNativeValue();
+        if (msg.sender == address(poolManager) && initialized && _key.currency0.isAddressZero()) {
+            accountedNative += msg.value;
         }
     }
 }

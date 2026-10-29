@@ -1,69 +1,32 @@
-# Additional vault tests
+# Verification coverage
 
-These tests extend the existing suite without replacing its fixtures or changing production contracts.
-They run offline against the vendored Uniswap v4 PoolManager. No dependency installation, fork, FFI,
-environment mutation, or production deployment address is needed.
-
-| File | Additional coverage |
-| --- | --- |
-| `VaultAccountingInvariant.t.sol` | Three actors, 256 random sequences of 64 calls, deposits to other receivers, partial/full withdrawals, delegated share transfers, raw donations, fee donations, both swap modes, cooldown/rebalance decisions, and irreversible emergency exits. |
-| `VaultFailurePaths.t.sol` | Exact errors and state rollback after second-token pull failures, fee harvesting followed by slippage, withdrawal minima, oversized budgets, invalid receivers, invalid pool initialization, and ownership transitions. |
-| `WethVaultIntegration.t.sol` | ETH-backed WETH; a sole-vault pool rebalancing in both directions with exact input and output after an empty-pool price move; manager balances matching the deposit minus swap cash flows exactly; settlement before router funding; a first deposit re-centred on the feed (one-sided basket refused, failed deposit leaves the band unchanged, only the cost is pulled); emergency payouts in wrapped tokens. |
-| `MathProperties.t.sol` | Six properties with 1,000 inputs each over the exact moments (`sum` = 8 × mean, `sigma8` = ⌊8σ⌋): order and reflection symmetry, nearest-tick rounding of the whole-tick view, known distributions, minimal outward band rounding from the unrounded mean, strict 1.5σ trigger boundaries, principal rounding and price monotonicity, and budget monotonicity. Pinned cases: an unrounded-mean trigger case, zero, and one base unit. |
-
-## Independent accounting model
-
-The accounting campaign deliberately uses a pool whose sole LP is the vault. Its signed token ledger
-starts with the known 170-token deposits on each side, then records measured depositor/recipient wallet
-flows, donations, and the router's swap deltas. It never updates that ledger from `totalAssets()`.
-After every action:
-
-- Physical manager plus hook balances must equal the external cash-flow ledger exactly.
-- Reported vault assets cannot exceed that backing; assets stranded in the manager are bounded by
-  four base units per accounting action, allowing only integer rounding from principal and fees.
-- Each actor's shares and total supply must match a separate mint/burn/transfer ledger.
-- The circular feed must match an append-only history of actual post-swap `slot0` ticks.
-- A rebalance fires exactly when the cooldown has passed, emergency mode is off, shares other than the
-  locked minimum exist, and 2·|8·tick − sum| > 3·sigma8 (the unrounded 1.5σ test).
-- Emergency activation must remain permanent, with no liquidity or claims left in the manager.
-
-The bounded tick domain is [-600, 600], and budgets include zero through five tokens. Fees, raw
-donations, and trades are distinct actions. Bounds keep successful actions affordable; invalid zero
-share quotes explicitly test the expected revert. Repeated deposit/withdraw cycles also assert that
-the caller cannot gain either token. Every completed random sequence activates emergency and redeems
-every actor's entire share balance. A deterministic scenario exercises every handler action and checks
-its successful-operation counters, so the campaign is supplemented by a non-vacuous branch check.
-
-The five discovery passes considered conservation, state transitions, round-trip rounding, value
-extraction/liveness, and vault/AMM properties. Source anchors are `SigmaHook.deposit/withdraw`,
-`_afterSwap`, `_assets`, `_quoteDeposit`, `_emergencyWithdraw`, and both math libraries. Pool reserves
-are not assumed to have a constant product across rebalances; principal losses from trading are
-accounted for using swap cash flows. The existing background-LP invariant remains complementary.
-
-## Reproduction
+All tests use the pinned Solidity 0.8.26/Cancun configuration and vendored dependencies. They run offline, with no environment reads or mutations, RPC, FFI, or custom filesystem permissions. Fixtures use Foundry's compiled artifact loader and actual CREATE2 construction, preserving hook address validation and constructor behavior. Nothing delivered imports `test/scratch/` or `.imd/reads/`.
 
 ```sh
-FOUNDRY_FUZZ_SEED=0x0dc471f47a25db42f2ae9a338992f18166f6afb6b2720570508910b719751856 forge test
 forge build
+FOUNDRY_FUZZ_SEED=0x075f6677a0a3d9b87b6715c5bc40f83a64604edac943aab568aa55927880dd0c forge test
+forge fmt --check
 ```
 
-Run counts are embedded in the new test source. For builds restricted to the test directory, append
-`--out test/scratch/out --cache-path test/scratch/cache` to either command. No delivered test imports
-anything from `test/scratch/` or `.imd/reads/`.
+| Suite | Coverage |
+| --- | --- |
+| `Flywheel.t.sol` | Callback only records samples; pool/cooldown/deviation/empty/emergency gates; exact 20/1/79 allocation; actual-caller bounty and ordering; zero-address-compatible and permanent-lock disposal, deferred buyback single-spend accounting; harvested fee reservations; deferred inventory, retry, no deposit-based range bypass, live exit and dislocation fuzzing. |
+| `SigmaVault.t.sol` | Canonical OpenZeppelin ERC-4626 asset and metadata; all four standard entrypoints and previews; rounding; delegated exit allowance failures; transferable ownership of LP value, fees and idle donations; inflation refusal; unwrap/emergency exit with unavailable manager. |
+| `NativeSafety.t.sol` | Fuzzed asymmetric first deposits after price displacement, exact costs/refunds and preview agreement; authorized receive sources and one-time WETH setting; owner rescue bounded to surplus; rejected/reentrant keeper recipients and complete rollback. |
+| `SigmaHook.t.sol` | Hook flags, explicit ownership, initialization, feed wrap, entry/exit bounds, fees and dilution, fresh initial ranges, large trends, real keeper calls, emergency behavior, bytecode size and round-trip fuzzing. |
+| `NativeVault.t.sol` | Native refunds, both swap directions/modes, callback sampling with cold manager reserves, keeper settlement, emergency exits without manager, rejecting and reentrant ETH recipients. |
+| `Adversarial.t.sol` | Taxed and callback tokens, saturated tick capacity, extreme prices, exact CREATE2 salt mining, prepaying swap router safety, unauthorized emergency redemption. |
+| `WethVaultIntegration.t.sol` | Actual ETH-backed WETH; both swap directions and input/output modes; exact manager cash flows including fee liabilities; fresh first-deposit bands; wrapped-token emergency payouts. |
+| `VaultFailurePaths.t.sol` | Exact errors and complete rollback after failed token pulls, fee harvest followed by slippage, output minima, invalid receivers/budgets, pool initialization and ownership transitions. |
+| `VaultAccountingInvariant.t.sol` | Independent external cash-flow and share ledgers; three actors, 256 sequences of 64 calls; deposits, exits, fees, raw donations, trades and transfers; ring history; full emergency exits. |
+| `VaultInvariant.t.sol` | Random deposits, exits, transfers, swaps, donations, elapsed time, permissionless keeper calls and emergencies; exact token conservation including permanent lock; zero flash deltas and manager lock; position consistency. |
+| `BandMath.t.sol`, `MathProperties.t.sol` | Full tick domain, fractional moments, strict deviation boundaries, negative grid rounding, budget and principal rounding, extreme prices and per-tick limits. Six properties use 1,000 inputs each. |
+| `SigmaToken.t.sol` | Unchanged fixed-supply token metadata, transfer/allowance behavior and lack of additional mint/admin paths. |
 
-## Reported defect
+The independent accounting model records actual wallet and router flows rather than deriving its book from `totalAssets()`. LP NAV **plus fee liabilities** must match physical custody within an operation-count rounding allowance. The sample-only swap callback must never update the keeper timestamp. The complementary background-LP invariant includes actual keeper executions and checks all physical token holders, including the permanent lock and keeper wallet.
 
-`.imd-findings.json` reports one medium defect, with a self-contained proof that fails on the current
-code. While the vault holds no position, `deposit()` refreshes the band from the feed before quoting,
-but `previewDeposit()` quotes against the stored band. After the price moves on an empty pool, the
-preview offers shares for a basket that `deposit()` then refuses with `Slippage()`. The delivered
-suite does not assert the preview in that state. The invariant handler compares preview and deposit
-only while the vault holds a position.
+These tests do not establish compatibility with the pinned chain's extended swap ABI or constitute an independent security audit. Deployment and adversarial review responsibilities are documented in the root README.
 
-The earlier low-tick rounding report (tick -658620) was addressed in the revised
-`VaultMath.liquidityForAmounts` and is covered by the implementation's own `BandMath.t.sol`, so it is
-no longer reported.
+## Local verification result
 
-No live-chain fork was requested or configured. These offline integrations do not establish behavior
-against a particular deployed manager/WETH pair; a chain-specific launch rehearsal remains outside
-this suite.
+Final verification with Solidity 0.8.26 and the seed above: **104 tests passed, zero failed, zero skipped**, across 13 suites. `forge build` and `forge fmt --check` passed. The hook runtime is 23,438 bytes (EIP-170 maximum: 24,576); its initcode is 37,016 bytes (EIP-3860 maximum: 49,152). SigmaHook, SigmaVault, SigmaMath and PermanentTokenLock have no unresolved linked-library references. Forge emits lint advisories about bounded casts, timestamp gates, exact balance checks and guarded external calls; this result is not a clean static-analysis audit.

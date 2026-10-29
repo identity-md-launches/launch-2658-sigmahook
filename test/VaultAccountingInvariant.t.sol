@@ -123,14 +123,7 @@ contract AccountingHandler is Test {
         if (beforePrice != TickMath.getSqrtPriceAtTick(target)) {
             (, int24 actualTick,,) = manager.getSlot0(key.toId());
             executionTick[sampleCount++] = actualTick;
-            // The trigger compares against the exact mean: |tick - sum / 8| > 1.5 sigma8 / 8.
-            (int256 sum, uint256 sigma8) = vault.moments();
-            int256 offset = int256(actualTick) * 8 - sum;
-            uint256 distance = uint256(offset < 0 ? -offset : offset);
-            // Only external holders justify a cycle; the locked minimum shares alone never do.
-            bool due = !emergencySeen && vault.totalSupply() > vault.MINIMUM_SHARES()
-                && block.timestamp >= previousRebalance + 30 minutes && 2 * distance > 3 * sigma8;
-            assertEq(vault.lastRebalance(), due ? block.timestamp : previousRebalance, "wrong rebalance trigger");
+            assertEq(vault.lastRebalance(), previousRebalance, "swap performed keeper work");
         } else {
             assertEq(vault.lastRebalance(), previousRebalance);
         }
@@ -270,6 +263,9 @@ contract VaultAccountingInvariantTest is Fixture, IAccountingDriver {
         assertEq(backing0, uint256(handler.book0()), "currency0 cash-flow ledger");
         assertEq(backing1, uint256(handler.book1()), "currency1 cash-flow ledger");
         (uint256 assets0, uint256 assets1) = hook.totalAssets();
+        (uint256 fee0, uint256 fee1) = hook.feeLiabilities();
+        assets0 += fee0;
+        assets1 += fee1;
         assertLe(assets0, backing0, "unbacked reported currency0 assets");
         assertLe(assets1, backing1, "unbacked reported currency1 assets");
         // Each liquidity/fee operation loses at most a few integer base units at these ticks.

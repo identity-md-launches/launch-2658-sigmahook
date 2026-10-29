@@ -11,9 +11,11 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {BandMath} from "src/libraries/BandMath.sol";
 
 interface ITradeDriver {
     function trade(int24 target) external;
+    function rebalance() external;
 }
 
 contract VaultHandler is Test {
@@ -59,6 +61,10 @@ contract VaultHandler is Test {
         driver.trade(int24(bound(seed, -500, 500)));
     }
 
+    function rebalance() external {
+        driver.rebalance();
+    }
+
     function donate(uint64 a0, uint64 a1) external {
         vm.startPrank(alice);
         IERC20(Currency.unwrap(key.currency0)).transfer(address(hook), bound(a0, 0, 0.1 ether));
@@ -97,7 +103,7 @@ contract VaultInvariantTest is Fixture {
         _seedBackground();
         _deposit(alice, 10 ether, 10 ether);
         handler = new VaultHandler(hook, alice, bob, owner);
-        bytes4[] memory selectors = new bytes4[](7);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = VaultHandler.deposit.selector;
         selectors[1] = VaultHandler.withdraw.selector;
         selectors[2] = VaultHandler.trade.selector;
@@ -105,6 +111,7 @@ contract VaultInvariantTest is Fixture {
         selectors[4] = VaultHandler.transferShares.selector;
         selectors[5] = VaultHandler.advanceTime.selector;
         selectors[6] = VaultHandler.emergency.selector;
+        selectors[7] = VaultHandler.rebalance.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -114,6 +121,16 @@ contract VaultInvariantTest is Fixture {
         (uint160 price,,,) = manager.getSlot0(key.toId());
         uint160 limit = TickMath.getSqrtPriceAtTick(target);
         if (price != limit) router.swap(key, limit < price, -int256(10_000 ether), limit);
+    }
+
+    function rebalance() external {
+        require(msg.sender == address(handler));
+        if (hook.emergencyMode() || hook.totalSupply() <= hook.MINIMUM_SHARES()) return;
+        if (block.timestamp < hook.lastRebalance() + 30 minutes) return;
+        (, int24 tick,,) = manager.getSlot0(key.toId());
+        (int256 sum, uint256 sigma8) = hook.moments();
+        if (!BandMath.deviates(tick, sum, sigma8)) return;
+        hook.flashRebalance(key);
     }
 
     function invariant_currencyAndShareConservation() public view {
@@ -162,7 +179,8 @@ contract VaultInvariantTest is Fixture {
 
     function _assertConservation(IERC20 asset) private view {
         uint256 balances = asset.balanceOf(address(this)) + asset.balanceOf(alice) + asset.balanceOf(bob)
-            + asset.balanceOf(address(manager)) + asset.balanceOf(address(hook)) + asset.balanceOf(address(router));
+            + asset.balanceOf(address(manager)) + asset.balanceOf(address(hook)) + asset.balanceOf(address(router))
+            + asset.balanceOf(hook.burnSink());
         assertEq(balances, asset.totalSupply());
     }
 }

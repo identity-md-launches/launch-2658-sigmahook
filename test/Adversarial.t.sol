@@ -134,6 +134,7 @@ contract AdversarialTest is Fixture {
         assertGt(_balance(key.currency0, address(hook)), 0);
         vm.warp(hook.lastRebalance() + 30 minutes);
         router.swap(key, false, -int256(1e35), TickMath.getSqrtPriceAtTick(20));
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         assertLe(hook.liquidity(), ownLiquidity);
         assertTrue(router.hookDeltasWereZero());
@@ -180,7 +181,7 @@ contract AdversarialTest is Fixture {
         weth.mint(address(prepay), 100 ether);
         vm.warp(hook.lastRebalance() + 30 minutes);
         prepay.swapExactIn(key, true, 5 ether, TickMath.getSqrtPriceAtTick(-600));
-        assertEq(hook.lastRebalance(), block.timestamp);
+        assertLt(hook.lastRebalance(), block.timestamp);
         assertGt(hook.liquidity(), 0);
         assertEq(_balance(key.currency0, address(hook)), 1 ether, "raw dust untouched by a claims-only cycle");
         assertEq(_balance(key.currency1, address(hook)), 1 ether);
@@ -188,6 +189,7 @@ contract AdversarialTest is Fixture {
         // The next cycle, opened by a router that pays after the swap, deploys the dust too.
         vm.warp(hook.lastRebalance() + 30 minutes);
         _moveTo(600);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         assertLt(_balance(key.currency0, address(hook)) + _balance(key.currency1, address(hook)), 2 ether);
         assertTrue(router.hookDeltasWereZero());
@@ -217,11 +219,16 @@ contract AdversarialTest is Fixture {
     }
 
     function test_saltToolUsesExactFactoryAndConstructorArguments() public {
-        MineSalt miner = new MineSalt();
+        MineSalt miner = MineSalt(deployCode("MineSalt.s.sol:MineSalt"));
         address newOwner = makeAddr("newOwner");
         (bytes32 salt, address predicted) =
             miner.run(address(this), manager, newOwner, address(token), address(this), 0, 200_000);
-        SigmaHook deployed = new SigmaHook{salt: salt}(manager, newOwner, address(token), address(this));
+        SigmaHook deployed = _createHook(
+            bytes.concat(
+                vm.getCode("SigmaHook.sol:SigmaHook"), abi.encode(manager, newOwner, address(token), address(this))
+            ),
+            salt
+        );
         assertEq(address(deployed), predicted);
         assertEq(deployed.owner(), newOwner);
         vm.expectRevert(MineSalt.SearchExhausted.selector);

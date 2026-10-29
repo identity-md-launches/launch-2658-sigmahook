@@ -157,19 +157,19 @@ contract SigmaHookTest is Fixture {
         uint256 sharesA = _deposit(alice, 10 ether, 10 ether);
         router.donate(key, 2 ether, 2 ether);
         (uint256 assets0, uint256 assets1) = hook.totalAssets();
-        assertApproxEqAbs(assets0, 12 ether, 2);
-        assertApproxEqAbs(assets1, 12 ether, 2);
+        assertApproxEqAbs(assets0, 11.58 ether, 2);
+        assertApproxEqAbs(assets1, 11.58 ether, 2);
         uint256 sharesB = _deposit(bob, 10 ether, 10 ether);
         assertLt(sharesB, sharesA);
-        assertApproxEqRel(sharesB * 12, (sharesA + 1_000) * 10, 1e12);
+        assertApproxEqRel(sharesB * 1158, (sharesA + 1_000) * 1000, 1e12);
         vm.prank(bob);
         (uint256 received0, uint256 received1) = hook.withdraw(sharesB, 0, 0, bob, block.timestamp);
         assertLe(received0, 10 ether);
         assertLe(received1, 10 ether);
         vm.prank(alice);
         (received0, received1) = hook.withdraw(sharesA, 0, 0, alice, block.timestamp);
-        assertApproxEqAbs(received0, 12 ether, 20);
-        assertApproxEqAbs(received1, 12 ether, 20);
+        assertApproxEqAbs(received0, 11.58 ether, 20);
+        assertApproxEqAbs(received1, 11.58 ether, 20);
     }
 
     function test_circularFeedUsesPostExecutionSlot0AndWraps() public {
@@ -196,6 +196,7 @@ contract SigmaHookTest is Fixture {
         assertEq(hook.lastRebalance(), initialTime);
         vm.warp(initialTime + 30 minutes);
         _moveTo(600);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         uint256 nowTime = block.timestamp;
         _moveTo(900);
@@ -221,6 +222,7 @@ contract SigmaHookTest is Fixture {
         _deposit(alice, 10 ether, 10 ether);
         vm.warp(hook.lastRebalance() + 30 minutes);
         _moveTo(300);
+        hook.flashRebalance(key);
         (uint128 oldPosition,,) = manager.getPositionInfo(key.toId(), address(hook), -60, 60, hook.POSITION_SALT());
         assertEq(oldPosition, 0);
         (int24 proposedLower, int24 proposedUpper) = hook.proposedBands();
@@ -245,6 +247,7 @@ contract SigmaHookTest is Fixture {
         uint256 t = block.timestamp + 31 minutes;
         vm.warp(t);
         _moveTo(2000);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), t);
         assertGt(hook.liquidity(), 0, "capital redeployed on the trend cycle");
         assertTrue(router.hookDeltasWereZero());
@@ -258,6 +261,7 @@ contract SigmaHookTest is Fixture {
             t += 31 minutes;
             vm.warp(t);
             _moveTo(i % 2 == 0 ? int24(-1500) : int24(1500));
+            hook.flashRebalance(key);
             assertEq(hook.lastRebalance(), t);
             assertGt(hook.liquidity(), 0, "capital redeployed on a later cycle");
             assertTrue(router.hookDeltasWereZero());
@@ -265,18 +269,19 @@ contract SigmaHookTest is Fixture {
         }
     }
 
-    /// In a pool deep enough for the balancing trade to fill within the tick cap, a trend cycle
+    /// In a pool deep enough for the balancing trade to fill inside the range, a trend cycle
     /// leaves only a small idle remainder: the rest of the vault's value is in the new band.
     function test_deepPoolTrendRebalanceDeploysMostCapital() public {
         router.modify(key, -887220, 887220, 20_000 ether);
         _deposit(alice, 1_000 ether, 1_000 ether);
         vm.warp(block.timestamp + 31 minutes);
         _moveTo(2000);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         assertGt(hook.liquidity(), 0);
         (uint160 price, int24 tick,,) = manager.getSlot0(key.toId());
         assertGe(tick, 2000);
-        assertLe(tick, 2000 + hook.REBALANCE_SWAP_MAX_TICKS());
+        assertLe(tick, hook.tickUpper());
         (uint256 a0, uint256 a1) = hook.totalAssets();
         uint256 idle0 = _balance(key.currency0, address(hook)) + manager.balanceOf(address(hook), key.currency0.toId());
         uint256 idle1 = _balance(key.currency1, address(hook)) + manager.balanceOf(address(hook), key.currency1.toId());
@@ -289,17 +294,16 @@ contract SigmaHookTest is Fixture {
     }
 
     /// The balancing trade is an ordinary swap by the hook: it pays the LP fee and stops at the band
-    /// edge or the tick cap, never beyond, and the vault keeps all its value in both currencies.
-    function test_balancingTradeStaysInsideBandAndCap() public {
+    /// edge, never beyond, and the vault keeps all its value in both currencies.
+    function test_balancingTradeStaysInsideBand() public {
         _seedBackground();
         _deposit(alice, 1_000 ether, 1_000 ether);
         vm.warp(block.timestamp + 31 minutes);
         _moveTo(2000);
+        hook.flashRebalance(key);
         (, int24 tick,,) = manager.getSlot0(key.toId());
         assertLe(tick, hook.tickUpper());
         assertGe(tick, hook.tickLower());
-        assertLe(tick, 2000 + hook.REBALANCE_SWAP_MAX_TICKS());
-        assertGe(tick, 2000 - hook.REBALANCE_SWAP_MAX_TICKS());
         (uint256 a0, uint256 a1) = hook.totalAssets();
         assertGt(a0, 0);
         assertGt(a1, 0);
@@ -311,6 +315,7 @@ contract SigmaHookTest is Fixture {
         _deposit(alice, 10 ether, 10 ether);
         vm.warp(block.timestamp + 30 minutes);
         _moveTo(20);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         (, int24 tick,,) = manager.getSlot0(key.toId());
         assertEq(tick, 20);
@@ -356,8 +361,10 @@ contract SigmaHookTest is Fixture {
         assertGt(used1, 0);
         assertGt(hook.liquidity(), 0);
         _assertPositionMatches();
-        // The quote was taken against the stale band and the deposit against the fresh one.
-        assertTrue(shares != quote || used0 != need0 || used1 != need1);
+        // The quote uses the same fresh band and rounded costs as execution.
+        assertEq(shares, quote);
+        assertEq(used0, need0);
+        assertEq(used1, need1);
         // Idle inventory is only the unused side's remainder.
         (uint256 a0, uint256 a1) = hook.totalAssets();
         assertLe(_balance(key.currency0, address(hook)) * 100, a0 + 100);
@@ -377,19 +384,24 @@ contract SigmaHookTest is Fixture {
         _deposit(bob, 10 ether, 10 ether);
         vm.warp(block.timestamp + 30 minutes);
         _moveTo(1200);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
     }
 
     function test_strayEthIsRefusedOnAnErc20Pair() public {
         (bool ok,) = address(hook).call{value: 1 ether}("");
         assertFalse(ok);
+        vm.deal(address(manager), 1 ether);
         vm.prank(address(manager));
         (ok,) = address(hook).call{value: 1 ether}("");
-        assertFalse(ok);
+        assertTrue(ok);
+        assertEq(address(hook).balance, 1 ether);
+        vm.prank(owner);
+        hook.rescueStrayETH();
         assertEq(address(hook).balance, 0);
     }
 
-    function test_rebalanceCompoundsAllAccruedFeesAndDust() public {
+    function test_rebalanceCompoundsNetAccruedFeesAndDust() public {
         _deposit(alice, 10 ether, 10 ether);
         uint128 beforeL = hook.liquidity();
         router.donate(key, 1 ether, 1 ether);
@@ -400,6 +412,7 @@ contract SigmaHookTest is Fixture {
         IERC20(Currency.unwrap(key.currency1)).transfer(address(hook), 0.1 ether);
         vm.warp(hook.lastRebalance() + 30 minutes);
         _moveTo(20);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         assertGt(hook.liquidity(), beforeL);
         _assertPositionMatches();

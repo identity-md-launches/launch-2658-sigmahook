@@ -1,38 +1,41 @@
-# Security review record
+# Security review record — Sprint 2
 
-This is an implementation self-review, not an independent security audit. No on-chain deployment, fork rehearsal, static-analysis service, formal verification or independent reviewer was used for this delivery. The requester-supplied security references informed the review; the task's behavior and acceptance criteria take precedence over examples in those references.
+Implementation self-review against the pinned security, address and L2 inputs. This is not an independent audit, fork test, on-chain verification, or a claim that production deployment is authorized. The existing token and immutable deployed hook are unchanged on chain.
 
-## Trust boundary
+## Fund boundaries
 
-- `PoolManager` is immutable and must be the reviewed v4 implementation. BaseHook checks its identity for every callback, including disabled callbacks. The unlock callback additionally requires an outstanding locally initiated unlock.
-- `factory` is immutable and is the only initializer. It chooses the paired currency and initial price, must include the immutable launch token, and cannot subsequently rebind the hook.
-- Owner authority consists of irreversible emergency activation and two-step ownership transfer. There is no route to withdraw another holder's assets or change trading logic.
-- Pair tokens must be standard non-rebasing ERC-20s (or native ETH), without transfer taxes, callbacks that require reentry, freezes, or confiscation. Incoming amounts are checked exactly, and ERC-20 returns are handled safely. This does not make arbitrary malicious tokens safe.
-- All pool state, share balances and raw balances are public. View quotes are not an oracle or a promise of future output.
+- The immutable manager and bound pool are the only strategy venue. Callback identity and the outstanding-unlock latch are checked. Own hook swaps skip callbacks under the vendored v4 dispatch rules. All operations finish with zero manager currency deltas.
+- The actual manager liquidity delta determines first-deposit spending and shares. Only caller-owned tokens are pulled. Preview and execution use the same refreshed range. Refunds happen inside the initial unlock. Donations cannot be silently included in a depositor's invested budget.
+- LP assets exclude reserved buyback and keeper proceeds, including uncollected fee allocations. `feesAccrued` is separated from principal; `callerDelta` includes fees already. Reserve debits use actual buyback inputs and outputs. Fees harvested by deposits cannot be paid to those depositors or reinvested twice.
+- Native balances have a separate accounting ledger. Only pool settlement native receipts enter that ledger. The owner's rescue is bounded by surplus over the ledger. Forced ETH cannot inflate LP quotes or make an LP withdrawal available to the owner.
+- Buyback proceeds enter a zero-address transfer or an immutable lock with no callable withdrawal logic. The current token requires the lock. Locking is not total-supply burning. No recipient supplied by a keeper or owner can redirect it.
+- The ERC-4626 wrapper holds only genuine basket receipts and has no admin. It inherits OpenZeppelin rounding, previews, limits and delegated allowance behavior. It adds a zero-share positive-deposit refusal. Its canonical asset is the hook's simple ERC-20 ledger, without token callbacks; arbitrary deployments over malicious replacement assets are outside the canonical architecture.
 
-## Reviewed fund paths
+## Adversarial paths checked
 
-| Path | Accounting and authorization | Verification |
-| --- | --- | --- |
-| Initialize | PoolManager callback, trusted factory sender, exact fee/spacing, launch-token inclusion, single pool ID | Mined production deployment, seeded buffer, unauthorized and second-pool refusal, extreme initial ticks |
-| Deposit | Caller-only token pull; harvest fees before pricing; shares floor / assets ceil; native excess excluded from NAV and refunded | Proportional deposits, fee dilution, invalid inputs, minimum shares, taxed token rollback, callback reentry |
-| Ordinary exit | Burn caller's shares; harvest; proportional idle balances plus fractional position burn; redeem claims; enforce bounds | Rounding conservation fuzz, unauthorized burns, output bounds, expired calls |
-| Rebalance | Fresh slot0 sample; exact-mean deviation in eighths; elapsed timestamp; external shares only; remove all old LP; balancing trade bounded by band edge, tick cap and deadband, skipped in an empty pool; reinvest principal, fees and dust | Cooldown boundary, sample wrap, same-range compounding, old position zero, tick-cap saturation, trend cycles in thin and deep pools, emptied vault stays quiet, resting-tick trigger |
-| Flash settlement | Positive deltas mint claims; negative deltas burn claims before raw payment; raw payment refused while another contract's sync is pending; verify settlement amount | Real PoolManager, router checks hook deltas before paying swap input, fresh manager with zero ETH, both swap directions and amount modes, prepaying router through a rebalance |
-| Emergency | Owner sets terminal mode; remove whole position; redeem all claims; owner receives no funds | Empty and funded vaults, fee and claim redemption, external LP fee collection still works |
-| Emergency exit | Public entry burns only caller shares and pays proportional raw balances; no manager dependency | Two holders, partial/alternate recipient, double exit refusal, rejecting and reentrant ETH recipients, unavailable manager |
+| Path | Expected result |
+| --- | --- |
+| Wrong pool / wrong manager / unexpected unlock | Revert before funds move |
+| Keeper too early / at or inside deviation threshold / no external shares / emergency | Revert with explicit gating error |
+| Price jump, shallow or empty active liquidity | Nonzero investment or explicit persistent, redeemable pending inventory |
+| Failed keeper payout or reentry | Whole rebalance rolls back; reentry is blocked |
+| Zero-address-rejecting launch token | Buyback proceeds reach the permanent lock; rebalance remains live |
+| Fees collected before keeper call | 20% and 1% remain reserved, excluded from LP pricing and investment |
+| First deposit after price moves, asymmetric budgets, native refunds | Preview matches actual costs; only consumed assets leave depositor |
+| Taxed/callback pair token | Exact-pull validation and reentrancy protection reject unsafe behavior |
+| ERC-4626 delegated exit without allowance / zero-share inflation | Revert atomically |
+| Forced ETH with funded native position or emergency vault | Rescue transfers only unaccounted surplus |
+| Emergency after keeper cycles | LP assets become raw; remaining fee reservations are released; holder exits do not need manager |
 
-The handler-based invariant suite mixes deposits, withdrawals, swaps, donations, share transfers, elapsed time and emergencies. It checks raw token conservation across all participants, exact share conservation, position-liquidity consistency, valid tick grids and circular indexes, zero outstanding flash deltas and a locked manager after each transaction. Emergency mode additionally implies zero vault liquidity and claims. Every completed randomized sequence is followed by both holders' full emergency exits.
+Meaningful unit, fuzz and stateful accounting tests use the actual vendored manager and the assignment's specified seed. State-machine tests check custody conservation, receipt conservation, fee liabilities, position accounting, sample history, no outstanding flash debts and full emergency exits. Tests are independent of network, environment values and order. See the accompanying test README for coverage.
 
-Arithmetic review covered the full usable tick domain, signed mean and negative grid rounding, zero volatility, integer square-root floors, strict 1.5-sigma comparisons, fee-growth wrapping, amount-to-liquidity overflow near extreme prices, and per-tick capacity shared with unrelated LPs. Liquidity sizing tests independently recompute rounded-up token costs to check that no budget is exceeded.
+## Limits and release responsibilities
 
-## Economic and operational limits
+1. The eight execution ticks can be manipulated in one block. The requested timestamp/deviation gates and band price limits are not a trusted price oracle. Deeper routes remove starvation at the expense of larger permitted price movement. No unverified router/TWAP is configured implicitly.
+2. The vault supports ordinary fixed-balance, untaxed native/ERC-20 assets. Token censorship, rebasing, upgrades or dishonest transfer returns can break liveness/accounting; exact pulls do not make a malicious token trustworthy.
+3. If there is no counterparty liquidity or per-tick capacity, capital can remain idle. Pending investment can be retried without paying another keeper bounty. Unfilled buyback inputs remain liabilities until a later eligible rebalance; the owner cannot take them via ETH rescue. Emergency cancels remaining reservations back to shareholders.
+4. A rejecting keeper only fails its own transaction. External swaps perform no fee distribution or investment work. Manager/token failure can still prevent emergency activation; successful activation removes that manager dependency for exits.
+5. The initial 1,000 locked basket units and ERC-4626 virtual share units are permanent rounding/inflation defenses, not substitutes for user slippage checks. Tiny donations/rounding may remain after the last external holder exits.
+6. The old hook is immutable. This source release requires a separately reviewed deployment and voluntary liquidity migration using the existing token. The pinned chain advertises an extended swap ABI; the protected local dependency is upstream v4. Its compatibility must be established before deploying. This is not proven by local unit tests.
 
-1. **Manipulable execution feed.** An attacker can change all eight observations through swaps, including within one block. Narrow ranges selected from it are exposed to MEV and adverse selection. The requested cooldown and statistics do not prevent this. The implementation does not silently add a different oracle, sample cadence or keeper permission.
-2. **The balancing trade is a visible market order.** Each cycle sells the surplus side in the vault's own pool, paying the 1.25% LP fee to other LPs and up to the price impact allowed by the band edge and the 300-tick cap. A pending cycle can be read from chain state and sandwiched within that limit; the cap bounds the loss per cycle, and the 30-minute cooldown bounds the frequency. In a pool too thin to fill within the cap, inventory stays partly idle for several cycles. Idle raw dust and ERC-6909 claims remain shareholder assets, fully redeemable, earning no fees while idle.
-3. **LP economics.** Fees do not guarantee profit. Price movement, impermanent loss, adversarial swaps, rounding and transaction costs can reduce returns. LP fee proceeds only arise from the vault's own LP position; factory LP fees remain the factory's.
-4. **Minimum-share residue.** The initial 1,000 share units are permanently locked in the hook. Their portion of assets remains after all external holders withdraw. Minimum output bounds are still required; the lock is not a substitute for slippage protection.
-5. **Emergency depends on the manager during activation.** If the manager or pair token already refuses asset transfers, activation can revert atomically. Once activation succeeds, exits need only the raw tokens and do not call the manager. Native recipients can choose an alternative address if they reject ETH.
-6. **Automatic callbacks consume gas and are atomic.** An unexpected failure during a triggered rebalance reverts its enclosing swap. The code handles unavailable raw input balances and exhausted per-tick capacity, but a broken token or manager remains a liveness dependency. Rebalancing does not have a catch-and-ignore path that could conceal incomplete accounting.
-
-Before release, an independent reviewer should assess these economic assumptions against the intended capital scale and traffic. The deployment operator should rehearse on the actual manager and factory, inspect all encoded parameters, confirm WETH/native pairing and Cancun support, and establish monitoring and an emergency operator. These are release responsibilities, not work represented as completed by the local test results.
+No Slither, Mythril, formal proof, independent review, or actual-chain deployment rehearsal is represented as completed here. An independent reviewer and the deployment operator must resolve the economic and manager-ABI risks before accepting public funds.

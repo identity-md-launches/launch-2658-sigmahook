@@ -69,6 +69,8 @@ contract NativeVaultTest is Fixture {
         uint256 initialTime = hook.lastRebalance();
         vm.warp(initialTime + 30 minutes);
         router.swap(key, true, exactOutput ? int256(9 ether) : -int256(100 ether), TickMath.getSqrtPriceAtTick(-50));
+        assertEq(hook.lastRebalance(), initialTime);
+        hook.flashRebalance(key);
         assertEq(hook.lastRebalance(), block.timestamp);
         assertTrue(router.hookDeltasWereZero());
         assertGt(address(manager).balance, 0); // router paid only after the callback completed.
@@ -100,6 +102,7 @@ contract NativeVaultTest is Fixture {
         _deposit(alice, 10 ether, 10 ether);
         vm.warp(hook.lastRebalance() + 30 minutes);
         _moveTo(-300);
+        hook.flashRebalance(key);
         assertGt(
             manager.balanceOf(address(hook), key.currency0.toId())
                 + manager.balanceOf(address(hook), key.currency1.toId()),

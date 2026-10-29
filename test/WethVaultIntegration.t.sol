@@ -25,7 +25,7 @@ contract WethVaultIntegrationTest is Fixture {
         alice = makeAddr("weth-alice");
         bob = makeAddr("weth-bob");
         owner = makeAddr("weth-owner");
-        manager = IPoolManager(address(new PoolManager(owner)));
+        manager = IPoolManager(deployCode("PoolManager.sol:PoolManager", abi.encode(owner)));
         token = new SigmaToken();
         wrapped = new WETH();
         hook = _deployHook(address(token));
@@ -72,7 +72,7 @@ contract WethVaultIntegrationTest is Fixture {
         (int24 lower, int24 upper) = hook.proposedBands();
         assertLt(lower, 60);
         assertGt(upper, 60);
-        // previewDeposit still quotes the stored band here; see the preview finding in .imd-findings.json.
+        // Preview and execution both use the refreshed band; one-sided entry cannot fund it.
         vm.prank(alice);
         vm.expectRevert(SigmaHook.Slippage.selector);
         hook.deposit(0, 10 ether, 1, alice, block.timestamp);
@@ -112,13 +112,16 @@ contract WethVaultIntegrationTest is Fixture {
             exactOutput ? int256(fromAbove ? paid1 : paid0) : -int256(100 ether),
             TickMath.getSqrtPriceAtTick(fromAbove ? int24(-50) : int24(50))
         );
-        assertEq(hook.lastRebalance(), block.timestamp, "swap must trigger the rebalance");
+        assertLt(hook.lastRebalance(), block.timestamp, "swaps must only sample ticks");
         assertTrue(router.hookDeltasWereZero(), "hook must settle before router input arrives");
         assertEq(hook.totalSupply(), shares + hook.MINIMUM_SHARES(), "swap changed share ownership");
         _assertPositionMatches();
         assertEq(key.currency0.balanceOf(address(manager)), uint256(int256(paid0) - int256(delta.amount0())));
         assertEq(key.currency1.balanceOf(address(manager)), uint256(int256(paid1) - int256(delta.amount1())));
         (uint256 assets0, uint256 assets1) = hook.totalAssets();
+        (uint256 fee0, uint256 fee1) = hook.feeLiabilities();
+        assets0 += fee0;
+        assets1 += fee1;
         assertApproxEqAbs(assets0, uint256(int256(paid0) - int256(delta.amount0())), 4);
         assertApproxEqAbs(assets1, uint256(int256(paid1) - int256(delta.amount1())), 4);
         assertEq(wrapped.totalSupply(), address(wrapped).balance, "WETH backing changed");
@@ -171,7 +174,7 @@ contract WethVaultIntegrationTest is Fixture {
             exactOutput ? int256(9 ether) : -int256(100 ether),
             TickMath.getSqrtPriceAtTick(token1Only ? int24(-50) : int24(50))
         );
-        assertEq(hook.lastRebalance(), block.timestamp, "swap must trigger the rebalance");
+        assertLt(hook.lastRebalance(), block.timestamp, "swaps must only sample ticks");
         assertTrue(router.hookDeltasWereZero(), "hook must settle before router input arrives");
         assertGt(input.balanceOf(address(manager)), 0);
         assertEq(hook.totalSupply(), shares + hook.MINIMUM_SHARES(), "swap changed share ownership");
@@ -180,6 +183,9 @@ contract WethVaultIntegrationTest is Fixture {
         if (hook.tickLower() != -60 || hook.tickUpper() != 60) assertEq(oldLiquidity, 0);
         _assertPositionMatches();
         (uint256 assets0, uint256 assets1) = hook.totalAssets();
+        (uint256 fee0, uint256 fee1) = hook.feeLiabilities();
+        assets0 += fee0;
+        assets1 += fee1;
         assertApproxEqAbs(assets0, uint256(int256(seed0) - int256(delta.amount0())), 4);
         assertApproxEqAbs(assets1, uint256(int256(seed1) - int256(delta.amount1())), 4);
         assertEq(wrapped.totalSupply(), address(wrapped).balance, "WETH backing changed");

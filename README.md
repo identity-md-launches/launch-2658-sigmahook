@@ -1,164 +1,97 @@
-# SigmaHook Auto-Vault
+# SigmaHook — keeper flywheel and ERC-4626 vault
 
-A Foundry project containing a fixed-supply launch token and a Uniswap v4 liquidity vault. The vault inherits Uniswap's `BaseHook` and issues transferable ERC-20 shares. It observes the pool's execution ticks, repositions its own liquidity, and compounds its fees. Solidity **0.8.26**, Cancun EVM, optimizer and IR compilation are pinned in `foundry.toml`.
+Solidity 0.8.26 / Cancun Foundry project. `SigmaHook` manages one Uniswap v4 position and a basket of its two currencies. `SigmaVault`, deployed automatically by the hook constructor, inherits the vendored OpenZeppelin `ERC4626` implementation and issues the transferable **svSHK** vToken. Existing SHK token source and supply are unchanged.
 
-## Build and test
-
-All Solidity dependencies, including the real v4 PoolManager used by tests, are vendored as ordinary files in `lib/`. No submodules, package installation, RPC, secrets, FFI, or filesystem permissions are needed. Compiler version 0.8.26 must be installed in Foundry's normal compiler cache.
+## Build and verify
 
 ```sh
 forge build
-FOUNDRY_FUZZ_SEED=0x0dc471f47a25db42f2ae9a338992f18166f6afb6b2720570508910b719751856 forge test
+FOUNDRY_FUZZ_SEED=0x075f6677a0a3d9b87b6715c5bc40f83a64604edac943aab568aa55927880dd0c forge test
 forge fmt --check
 ```
 
-`dependencies.lock.json` records upstream commits and archive hashes. `docs/SECURITY.md` records the security review scope and remaining deployment work. Nothing under `test/scratch/` is required by the project.
+Dependencies are already vendored in `lib/`; the build configuration and dependencies are unchanged. Tests use the real vendored PoolManager, actual CREATE2 deployment with the required hook bits, and local tokens. The fixture loads Foundry-generated contract artifacts to avoid embedding all creation bytecode in every test. No RPC, keys, environment reads, network installation, FFI, or additional filesystem permissions are required by the tests. The test seed above is supplied to Forge, not read by contracts or test cheatcodes.
 
-## Contracts and launch parameters
+## Architecture and units
 
-| Contract | Purpose | Constructor arguments |
+| Contract | Responsibility | Units |
 | --- | --- | --- |
-| `SigmaToken` | Launch ERC-20, **SigmaHook / SHK**, 18 decimals | None |
-| `SigmaHook` | Vault and ERC-20 share token, **SigmaHook Vault Share / svSHK**, 18 decimals | `IPoolManager manager_`, `address owner_`, `address launchToken_`, `address factory_` |
+| `SigmaToken` | Existing fixed-supply SHK launch token | SHK base units |
+| `SigmaHook` | Pool position, idle balances/claims, basket entry/exit, statistics, keeper fee pipeline | `sSHK` basket receipts; two-currency `totalAssets()` |
+| `SigmaVault` (`hook.vault()`) | OpenZeppelin ERC-4626 wrapper | `asset()` is the hook's ERC-20 basket receipt; `totalAssets()` is receipts held; shares are `svSHK` |
+| `SigmaMath` (`hook.math()`) | Stateless calculation/view helper, immutable and without custody | Band, price, position and liquidity calculations |
+| `PermanentTokenLock` (`hook.burnSink()`) | Irrecoverable buyback custody if the token rejects zero-address transfers | Launch tokens held forever |
 
-`SigmaToken` mints exactly **1,000,000,000 × 10¹⁸** units to its deployer, the launch factory. It has no owner, additional mint, burn, transfer tax, pause, blocklist, or upgrade mechanism. Vault shares are a different token and are minted only for deposits; holding SHK alone gives no claim on the vault.
+ERC-4626 specifies **one ERC-20 asset**. The existing strategy owns two currencies, including native ETH on the pinned launch. The chosen wrapper asset is therefore its basket receipt, rather than a manipulable spot-price conversion into SHK or an invented WETH address. Each receipt owns its fraction of pool principal, net uncollected fees, idle ERC-20/native balances, and ERC-6909 claims. Wrapping receipts preserves that ownership. Yield increases the underlying value of a receipt; it need not increase the number of receipts shown by ERC-4626 `totalAssets()`.
 
-Supply distribution is the launch factory's responsibility. The hook receives no allocation at launch, cannot use the factory's LP position, and starts with zero vault shares and liquidity. Users separately deposit capital to activate the vault.
+The hook's legacy two-budget methods are basket methods, not ERC-4626 methods. The canonical ERC-4626 address is **`hook.vault()`**, not the hook. The wrapper inherits all standard previews, conversions, limits, Deposit/Withdraw events, mint/redeem/withdraw flows and delegated withdrawal allowance checks. `underlyingAssets(vTokenShares)` provides a rounded-down look-through quote in pool currency order. Its conversion into receipts uses no price oracle; the look-through pool amounts reflect the manager's current position state. OpenZeppelin's virtual asset/share protection remains enabled; positive deposits that would mint zero vTokens revert. The wrapper has no admin, upgrade, sweep or external strategy investment function.
 
-Constructor parameters map to the launch's `$poolManager`, `$owner`, `$token`, and `$factory`. No network contract address is hardcoded. Constructors perform no external calls or external code checks. Ownership is explicitly assigned to `owner_`, never inferred from the deploying factory or `tx.origin`.
+Typical entry:
 
-The job's pair is **launch token / WETH**. The supplied launch reference instead opens **launch token / native ETH** on chain 4663. Both currency forms are implemented and tested. The trusted factory chooses the actual pair through the initialization `PoolKey`; WETH stays WETH, and native ETH stays native ETH. There is no wrapping, unwrapping, or guessed WETH address. For the launch described by the reference, initialize the native pair. A WETH deployment must use that chain's independently verified WETH address.
+1. Read `poolKey()` and `previewDeposit(max0,max1)` on the hook. Approve its exact ERC-20 requirements; for a native pair send `max0` ETH.
+2. Call `hook.deposit(max0,max1,minReceipts,receiver,deadline)`. The first deposit refreshes the range and mints receipt shares based on actual manager debits. Its 1,000 genesis receipt units remain permanently locked in the hook.
+3. Approve the receipt amount to `hook.vault()`, then call the wrapper's `deposit(receipts,receiver)` or `mint(vTokenShares,receiver)`.
 
-The factory must open a pool with fee **12,500 pips (1.25%)**, tick spacing **60**, this hook, and the constructor's launch token. The other currency is accepted from that factory-supplied key. These fixed fee and spacing values follow the supplied launch policy. Initialization reads the actual opening tick; it does not assume a 1:1 opening price or a particular token sort order. Only the factory may initialize, only once. The hook permanently binds to the resulting full pool ID. ERC-20 currency code is checked at initialization, after deployment.
+Typical exit: call the wrapper's `redeem(vTokenShares,receiver,owner)` or `withdraw(receipts,receiver,owner)`, then call `hook.withdraw(receipts,min0,min1,receiver,deadline)`. ERC-4626 withdrawals return receipts; basket exits return the two pool currencies. Each approval is to its specific contract. Shares of either layer can be transferred normally. During emergency mode unwrap to receipts and call `hook.emergencyWithdraw`, including its partial/alternative-recipient overload.
 
-## Deployment sequence
+## Defect fixes
 
-1. Build with the pinned configuration; inspect `SigmaToken` and `SigmaHook` artifacts. All libraries are internal/inlined and no link placeholders are required.
-2. The launch factory deploys `SigmaToken`. Obtain the actual token, PoolManager, owner and factory addresses from the launch system. The reference supplies the owner as `0xdbeab8243f318f1bbf815d85a8a869def1510b61`; launch tooling should still encode it through `$owner`.
-3. Mine a CREATE2 salt for the exact hook creation code and four ABI-encoded constructor arguments. The lower 14 address bits must be **`0x1040` (4160)**: `AFTER_INITIALIZE | AFTER_SWAP`. All other bits must be unset. `BaseHook` enforces this in its constructor.
-4. `script/MineSalt.s.sol` provides a local `run(deployer, manager, owner, token, factory, start, attempts)` function. Its `deployer` is the address actually executing CREATE2. It returns a salt and predicted address, reads no environment, and broadcasts nothing. Start with 200,000 attempts; if exhausted, use the next start. Also check the predicted address has no code on the target chain. Any compiler setting, constructor value or deploying factory change requires remining.
-5. The factory deploys the hook and initializes its pool atomically, using the launch's derived opening price and sorted currencies. The required initialization callback prevents initialization against the predicted hook address before its code exists.
-6. Verify constructor values, bytecode, owner, pool ID, flags, currencies, fee and spacing on the actual chain. Deposit through the vault only after reviewing the initialized pool.
+**Exact first deposit.** Preview and execution use the same freshly computed range and per-tick capacity. Only predicted rounded liquidity costs are pulled from the caller. Inside the unlock, `modifyLiquidity` returns the authoritative currency debits; `amount0Consumed` and `amount1Consumed` determine paid liquidity and the initial share mint. Any overpayment is refunded to the caller in that unlock, including the entire unused native budget. Preexisting donations are excluded from the first deposit's investment budgets. Existing holders' fees are harvested before later deposit pricing; pending fee allocations are excluded from LP NAV.
 
-The network's manifest step supplies `launch.json`; this project intentionally does not supply one. No script signs or submits transactions. A real fork rehearsal and independent security review remain deployment responsibilities.
+**Inventory starvation.** The fixed 300-tick limit has been removed from the strategy. An internal trade can traverse the selected statistical band, stopping one tick inside its edge. The hook recalculates affordable liquidity after the actual trade and can make bounded additional ratio corrections if it would otherwise mint zero. Empty active liquidity is not traded merely to move slot0. If no nonzero position can be funded, `InvestmentDeferred` and `investmentPending` make the condition explicit. Assets remain in persistent raw balances/ERC-6909 claims and remain redeemable. `retryInvestment(key)` is public, pays no bounty, and retries the selected range without resetting the cooldown or choosing a new range. A later eligible keeper rebalance can also select a new range. Deposits into a deferred vault preserve the selected range and cannot bypass this gate. EVM transient storage is transaction-scoped and cannot preserve assets between calls; it is not used as an inter-transaction escrow.
 
-## Feed, statistics and range
+**Native ETH.** `receive()` accepts only the PoolManager or the once-configured `WETH` source. `accountedNative` tracks native deposits, manager receipts, payments and refunds. `rescueStrayETH()` is owner-only and sends **only `address(this).balance - accountedNative`** to the current owner. Forced ETH and unsolicited WETH-source ETH are outside LP NAV; the owner cannot rescue native pool principal, claims, fee reserves or emergency withdrawal assets. WETH remains wrapped in a WETH pair; the strategy never unwraps it.
 
-Only `afterInitialize` and `afterSwap` are enabled. Each external callback inherits the PoolManager-only check. All return-delta permissions are disabled, and `afterSwap` returns its selector and zero. No callback blocks external LP additions, removals, or zero-liquidity fee collection, including during emergency mode.
+## Keeper execution and fee accounting
 
-Initialization seeds all eight `int24` buffer entries with the launch tick, sets the circular write index to zero, and starts the cooldown. Every subsequent swap callback reads the **post-swap `slot0.tick`** from the bound pool, replaces one entry, advances the index modulo eight, and computes the moments in **eighths of a tick**, so that no rounding of the mean leaks into the trigger or the band:
+`afterSwap` validates the bound pool, reads the execution tick, writes one circular-buffer slot and emits `SampleRecorded(index,tick)`. It performs no statistics, swaps, liquidity changes, fee payouts or rebalance. The buffer has eight execution samples, initially seeded with the launch tick. Own internal swaps do not reenter the hook under v4 dispatch rules.
 
-```text
-sum       = sum(ticks)                                  # exactly 8 * mean
-variance8 = floor(sum((8*tick - sum)^2) / 8)            # 64 * population variance
-sigma8    = floor(integer_sqrt(variance8))              # floor(8 * sigma)
-lower     = floor_to_spacing(floor((sum - 3*sigma8) / 8))   # mean - 3 sigma
-upper     = ceil_to_spacing(ceil((sum + 3*sigma8) / 8))     # mean + 3 sigma
-```
+Anyone may call **`flashRebalance(PoolKey key)`**. It reverts unless the vault is live, the key matches, external receipts exist, at least 30 minutes have passed since `lastRebalanceTimestamp()`, and the current tick lies **strictly beyond 1.5 sigma** from the running SMA. Equality does not qualify. The time gate uses `block.timestamp`. Statistics retain fractional precision in eighths of a tick. The new range is SMA ± 3 sigma, rounded outward to the tick-spacing grid; zero sigma gets a nonempty range.
 
-Intermediate arithmetic uses 256-bit integers. Negative values round toward negative infinity. Equal bounds, possible at zero volatility, widen by one spacing on each side. Bounds are clamped to v4's usable ticks, preserving at least one spacing at either extreme. Because every sample lies within `sqrt(7)` sigma of the mean, the band always brackets the latest execution tick. `moments()` returns `(sum, sigma8)`; `statistics()` returns the whole-tick view `(mean rounded to nearest, half up; floor(sigma8 / 8))` for display and events. `ticks(index)`, `nextSample`, `proposedBands()`, `tickLower`, and `tickUpper` expose the rest.
+One hook-initiated unlock removes the old position, allocates harvested fees, processes buybacks, pays the caller, balances inventory and redeploys principal plus net yield. Only the manager's separate `feesAccrued` result is treated as fees; `callerDelta` already contains those fees and is never counted twice.
 
-The callback rebalances precisely when all of these hold:
+For each currency and harvest, with fee amount `F`:
 
-- Emergency mode is inactive and **external** shares exist: `totalSupply() > MINIMUM_SHARES`. The 1,000 locked shares alone never trigger a cycle after every holder has left.
-- `block.timestamp >= lastRebalance + 30 minutes`.
-- `2 * abs(8*activeTick - sum) > 3 * sigma8`, i.e. `abs(activeTick - mean) > 1.5 sigma` with the exact mean, using the **freshly updated** window. Equality does not trigger. With seven samples at one tick and one a tick nearer zero, the resting tick does not trigger and the outlier does.
+- Buyback reserve: `floor(F * 2000 / 10000)` (20%).
+- Keeper reserve: `floor(F * 100 / 10000)` (1%).
+- LP yield: the remainder (79% plus integer rounding dust).
 
-This is an **eight-execution sample**, not a time-weighted oracle. Multiple swaps in a block can replace the whole window. The 30-minute condition limits rebalance frequency; it does not make the samples manipulation-resistant. That deliberate specification choice exposes LPs to adverse selection, MEV, and manipulated range selection. No guaranteed yield or protection from impermanent loss is implied.
+These reserves are recognized on **every** harvest, including deposits/withdrawals, so those paths cannot compound or pay out the buyback/bounty allocations. `feeLiabilities()` also includes the corresponding uncollected allocations. Raw token donations are LP assets and do not incur this fee split. Principal is never charged a 21% fee.
 
-## Rebalance and flash accounting
+The launch-token allocation is disposed directly. The paired-currency allocation is swapped in the bound pool into the **same existing launch token**, using actual swap debits/credits and the statistical range price limit. The complete available keeper reserve is paid in its original pool currencies to the `flashRebalance` caller, before reinvestment. A failed receiver or token transfer reverts the entire operation, including the timestamp, burn/lock and position changes; another keeper can try. A reentrancy guard covers asset entrypoints and keeper payouts.
 
-The swap's PoolManager unlock is already active. The hook directly:
+If the paired buyback cannot be fully filled (for example the vault was the only LP), its unspent amount stays in `burnReserve0/1`, excluded from LP assets and future investment budgets. `BuybackDeferred` reports it. A later eligible rebalance retries it. Buyback output is disposed immediately, and the 79% remains available for the new range. This preserves fee allocation without fabricating an external router or blocking regular swaps for lack of a buyback venue.
 
-1. Removes 100% of its old position using its fixed `POSITION_SALT`.
-2. Accounts for the returned principal **and all accrued LP fees**. `modifyLiquidity`'s caller delta already includes fees; the separate fee return is used only for reporting.
-3. Assigns the new bands from the fresh feed.
-4. **Balances the inventory to the band's ratio** with one exact-input swap in the same pool (see below), then adds as much liquidity as its two balances and the pool's remaining per-tick capacity support, with conservative integer rounding.
-5. Retains all unused balances for future cycles. The cooldown timestamp changes atomically with the successful cycle.
+## Burn policy decision
 
-Positive deltas are converted into ERC-6909 claims owned by the hook. Adding liquidity consumes those claims first, then uses any raw dust with `sync → transfer → settle` (or native settlement). Every hook delta is zero before returning to the swap router. This matters on a freshly funded, one-sided pool: the router has not paid its input during `afterSwap`, so taking raw principal there could fail even though the final swap is solvent. Claims defer that transfer while preserving full backing at unlock completion. Deposits, exits and emergency activation open their own authenticated unlocks; rebalances never nest an unlock.
+The pinned live SHK contract inherits OpenZeppelin ERC-20, rejects `transfer(address(0),amount)`, and exposes no public burn or upgrade function. A literal unconditional zero-address transfer would make every fee-bearing rebalance fail. The selected compatibility policy is: attempt the requested zero-address transfer; if the token refuses it, transfer the exact launch-token amount to the newly created **`PermanentTokenLock`**. The lock has no owner, functions, approval path, withdrawal, self-destruct, delegatecall or upgrade mechanism. No arbitrary address or owner-controlled burn recipient is used.
 
-**Prepaying routers.** A router may pay its input before the swap (`sync`, transfer, `swap`, `settle`). The manager has a single synced-currency slot, so a hook that synced inside `afterSwap` would absorb that transfer and break the router's settlement. When the manager reports a synced currency at rebalance time, the cycle pays **from claims only** (`_budget` excludes raw balances) and raw dust waits for a cycle opened by a router that pays afterwards, or for the next deposit or withdrawal, which run in the hook's own unlock. A cycle never syncs while another contract's payment is pending.
+`LaunchDisposed(amount,zeroAddressTransfer)` distinguishes the paths. For the existing SHK token the lock path **reduces circulating supply but does not reduce `totalSupply()`**. Neither the launch token nor its supply is replaced or re-minted. Even for a token accepting zero-address transfers, no total-supply decrease is assumed without that token implementing it. This explicitly resolves the incompatible burn instruction that stopped the earlier attempt.
 
-### The balancing trade
+## Deployment parameters and existing deployment
 
-A trend carries the price out of the old band, so the burn returns a single currency, while the new band, built from samples that include the current tick, always brackets the price and needs both. Without a trade the vault would stay one-sided for good (the reopened finding). Each cycle therefore sells the surplus side into its own pool:
+The four hook constructor arguments remain `(IPoolManager manager_, address owner_, address launchToken_, address factory_)`. They must be nonzero. Ownership is explicitly assigned to `owner_`, not the deploying factory. CREATE2 hook bits remain `0x1040` (`afterInitialize` and `afterSwap`, no return-delta flags). Re-mine the salt for the final creation code with `script/MineSalt.s.sol`; changing code changes the CREATE2 hash. The constructor creates its canonical wrapper, stateless math helper and permanent lock. There is no separate token deployment in this update.
 
-- The target split follows the band at the current sqrt price `p`: per unit of liquidity the range holds `(p − lower)` of currency1 and `(upper − p) · p / upper` of currency0 value, both in sqrt-price units, so the currency1 share of value is `(p − lower) · upper / p` over the sum of both weights (`VaultMath.targetAmount1`). Outside the band the price is clamped to the nearer edge, which yields a one-sided target.
-- The trade is skipped when the imbalance is below **`REBALANCE_SWAP_DEADBAND_BPS = 100`** (1% of vault value), or when the pool has **no active liquidity** (a swap would only displace the price).
-- It is an exact-input swap with a price limit at the band edge it moves towards, and never further than **`REBALANCE_SWAP_MAX_TICKS = 300`** (about 3%) from the current tick. The vault never trades outside the range it is about to supply. In a pool too thin to fill within that cap, the remainder stays idle and later cycles continue the conversion.
-- The PoolManager skips a hook's own callbacks for a swap the hook sends itself, so the trade records no sample and cannot recurse. Its output is minted as claims and its input is burned from claims, so it works inside the swapper's unlock before the router has paid.
-- The trade pays the pool's 1.25% LP fee to the other LPs and bears price impact up to the limit. Because a pending cycle is visible on chain (cooldown expired, deviation met), it can be sandwiched within the limit; the band edge and the tick cap bound that loss per cycle. This is the cost of meeting the specification's step 4 ("redeploy principal + fees into the new tight range") from a one-sided inventory. `InventoryBalanced(zeroForOne, amountIn, delta0, delta1)` reports every trade.
+Factory-only initialization binds one pool permanently. Required pool fee is 12,500 pips (1.25%), spacing is 60, and one currency must be the immutable launch token. The other currency may be native ETH or a standard ERC-20. There is no pool reassignment or upgrade.
 
-Both constants are the implementer's choices for numbers the brief left open. When other LPs have filled either boundary's per-tick capacity, only the supported portion becomes liquidity. `totalAssets()` includes idle inventory, the position principal, and uncollected fees. No hook, performance, management, withdrawal, or keeper fee is charged.
+Pinned project inputs identify Robinhood Chain, chain ID **4663**, with:
 
-## Deposits, shares and normal exits
+| Item | Pinned address |
+| --- | --- |
+| Existing SHK token | `0x4fe865ad3b3ef64b2af9c38c78abf5c6e68c1164` |
+| Existing immutable Sprint 1 hook | `0xcc0551d738d964a2d68ac3674e7fe4a2e69f1040` |
+| PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` |
 
-Amounts always follow **currency0/currency1 order**, in the currencies' smallest units. Accounting does not assume that both currencies have 18 decimals or convert one token's value into the other at an oracle price. The share token itself uses 18 display decimals.
+The pinned live pool pairs SHK with **native ETH**, not WETH. These are input records, not newly verified on-chain addresses. No transactions, deployment, migration, or token mint were performed by this assignment. Updating source cannot patch the immutable live hook. Deployment operators must arrange a reviewed new hook/pool using the existing SHK token and a voluntary exit/re-entry migration for existing LPs. Existing shares and deployed ABIs do not change retroactively. The historical `launch.json` is not a migration instruction and is not rewritten by this task.
 
-`previewDeposit(amount0Max, amount1Max)` returns shares and required amounts at current state. `deposit(amount0Max, amount1Max, minShares, receiver, deadline)` requires a positive `minShares`, valid receiver and unexpired deadline. Approve the hook for the required ERC-20 amounts. In a native pool, send exactly `amount0Max` as `msg.value`; unused ETH is refunded to the caller. No ETH is accepted through this entry point for an ERC-20/WETH pool.
-
-On the first deposit, the two budgets size the initial liquidity, which determines the share supply, and **only the rounded-up cost of that liquidity is pulled**: the unused side of an unbalanced budget stays with the depositor (an immediate exit loses rounding dust only). Exactly **1,000 minimum share units** are permanently minted to the hook itself, with no recovery or redemption path, as an initial-share inflation mitigation. The depositor receives the remainder. Use a substantial first deposit; tiny or unusable deposits revert. Direct donations before the first deposit accrue to this initial share supply.
-
-Whenever the vault holds no position (`liquidity == 0`: before the first deposit, or after every holder has left and a cycle found no capacity), `deposit` first **refreshes the band from the feed** (`BandRefreshed`), so a first deposit into a launch pool that has already traded invests around the current price rather than the launch tick. `previewDeposit` quotes against the stored band; in that state the stored band may be stale, so submit a `minShares` from a quote taken in the same block or compare with `proposedBands()`.
-
-Later deposits first harvest outstanding fees for existing holders, then mint the minimum of the two proportional share quotes, rounding shares down and required token contributions up. A side with zero holdings imposes no contribution. Principal is rounded up for deposit pricing, preventing rounding dilution. Only actual required ERC-20 amounts are pulled, and only from `msg.sender`. Deposits that would create zero shares or miss `minShares` revert atomically. Exact input balance checks reject transfer-tax tokens. Rebasing, taxed, blocked, or otherwise nonstandard pair tokens are unsupported; the factory must select the standard launch token and canonical WETH/native ETH.
-
-`withdraw(shares, amount0Min, amount1Min, receiver, deadline)` burns only caller-owned shares and removes the corresponding fraction of liquidity, accrued fees and idle balances. Outputs round down. It collects fees before dividing, redeems enough claims, and returns raw pool currencies. Minimum amounts and deadlines protect the caller against stale quotes; failed payments or bounds revert the entire operation. Shares remain transferable, including during emergency mode.
-
-Minimum shares and rounding leave a small permanent residual owned by the locked shares. The last external shareholder does not receive that residual. `minShares` and minimum withdrawal amounts must be chosen from a reviewed quote; a frontend should never silently substitute permissive bounds. External price changes and donations can change a quote before execution.
-
-## Emergency mode and administration
-
-Only `owner()` may call `activateEmergencyMode()`. It removes **all** vault liquidity, collects fees, redeems **all** claims, and leaves both raw assets at the hook. The owner receives nothing. Emergency mode is irreversible and prevents deposits, normal withdrawals, and further investment; use emergency withdrawals instead. Swaps and other LPs' positions remain usable, and the execution feed continues updating.
-
-Anyone may call `emergencyWithdraw()` to burn **their own entire share balance**, or `emergencyWithdraw(shares, receiver)` for a partial redemption or different destination. Each receives `floor(rawBalance * shares / totalSupply)` of each asset. No PoolManager call, oracle, keeper, cooldown, or owner's further approval is needed. State updates and the share burn precede payments; a reentrancy guard covers all asset entry and exit paths. A recipient that rejects ETH can choose another receiver without losing shares, since failed transfers roll back.
-
-The owner can transfer ownership through the two-step `transferOwnership` / `acceptOwnership` flow. Renunciation is disabled to retain an emergency operator. There is no asset-sweep, manual price setter, manual range override, pool reassignment, upgrade, arbitrary external-call, or additional fee power. Accidental transfers of unrelated assets have no recovery function. The hook's `receive()` accepts ETH only from the PoolManager, and only when currency0 is native: stray ETH sent to a WETH-paired vault is refused rather than locked.
+The network input marks `extendedSwapParams: true`, while the protected vendored core uses upstream three-field `SwapParams`. Local integration tests establish correctness against that vendored ABI, not compatibility with an undocumented extended on-chain selector. Before any deployment, the operator must verify the target manager's swap/callback ABI and resolve any extension through the deployment integration. This delivery does not guess extra fields or claim a fork rehearsal.
 
 ## After launch
 
-No external-service setter is needed: manager, owner, token and factory are constructor-bound, and the factory's initialization binds the pool. Verify those values before accepting user deposits. For WETH, the launch operator must verify the other currency against the target chain's official deployment and token interface.
+- **Optional WETH source:** owner calls `setWETH(verifiedWrappedEtherAddress)` once, only if WETH-source ETH reception is needed. Obtain and verify the canonical deployment and bytecode from the target chain's official registry. The supplied network inputs contain no WETH address, so none is invented. Until configured, only the PoolManager may send ETH through `receive()`; native-pool trading, deposits, withdrawals, fee collection and rebalancing already work. The setting only authorizes an ETH sender, not an external router or asset allowance.
+- **Operator:** verify constructor arguments, hook flags, `poolKey()`, canonical `vault()`, its `asset()`, and `burnSink()`; verify Cancun and manager ABI compatibility, factory initialization, fee/spacing and currency order. Publish the new hook/wrapper addresses separately from the historical deployment. Never redeploy or re-mint SHK for migration.
+- **Keepers:** monitor ticks, statistics, timestamp, LP inventory and fee reserves. Simulate `flashRebalance(key)` and submit when eligible; accept native ETH if the pool uses it. Gas is the keeper's expense; 1% fees do not guarantee profit. Monitor `InvestmentDeferred` and retry when liquidity returns. Deferred buybacks need a future eligible keeper rebalance and available paired liquidity.
+- **Owner:** operate the two-step ownership transfer and irreversible emergency exit, and rescue only stray ETH. Emergency activation collects all pool assets, cancels outstanding unexecuted fee allocations back to LPs, and pays the owner nothing. Thereafter holders redeem raw assets without the manager. The cancellation avoids orphaned fee reserves when no keeper job remains. Ownership cannot be renounced.
+- **Release reviewer:** perform an independent adversarial review and actual-chain integration rehearsal before public capital. See [security review](docs/SECURITY.md) and [test coverage](test/README.md).
 
-The owner should use an operationally accessible, reviewed ownership arrangement, monitor `SampleRecorded`, `FeesCollected`, `Rebalanced`, `InventoryBalanced`, `BandRefreshed` and vault balances, and activate emergency mode on a strategy or integration failure. Watch idle balances that persist across cycles (a pool too thin for the tick cap), unexpected pool prices, liquidity at the range boundaries, failed swaps and the time since the last rebalance. A quiet pool produces no new samples or automatic cycles; no keeper can force a rebalance outside the specified trigger. Swappers pay the extra gas of triggered cycles, including the balancing trade.
-
-Liquidity sizing divides by the small sqrt-price difference before multiplying by the large product, so very low prices (ticks below about −600,000) no longer lose up to half of the currency0 budget to an intermediate floored to a few units.
-
-The launch operator must verify Cancun compatibility, the actual manager implementation, fee configuration and atomic factory initialization, rehearse deposits/swaps/emergency exits on the target deployment, and arrange independent adversarial review before accepting public capital. Local tests use real v4 core code, but are not a fork rehearsal or an independent audit.
-
-## Hook configuration record
-
-```json
-{
-  "hook": "BaseHook",
-  "name": "SigmaHook",
-  "pausable": false,
-  "currencySettler": true,
-  "safeCast": true,
-  "transientStorage": false,
-  "shares": { "options": "ERC20" },
-  "permissions": {
-    "beforeInitialize": false,
-    "afterInitialize": true,
-    "beforeAddLiquidity": false,
-    "beforeRemoveLiquidity": false,
-    "afterAddLiquidity": false,
-    "afterRemoveLiquidity": false,
-    "beforeSwap": false,
-    "afterSwap": true,
-    "beforeDonate": false,
-    "afterDonate": false,
-    "beforeSwapReturnDelta": false,
-    "afterSwapReturnDelta": false,
-    "afterAddLiquidityReturnDelta": false,
-    "afterRemoveLiquidityReturnDelta": false
-  },
-  "inputs": {},
-  "access": "ownable",
-  "info": { "license": "MIT" }
-}
-```
-
-The utility fields describe the behavior: settlement is implemented directly in `_settle`, and casts are bounded before narrowing. The hook itself uses ordinary storage for its guard and unlock latch; the v4 PoolManager requires Cancun transient storage. The vendored `BaseHook` is from Uniswap's `v4-hooks-public` repository; its `ImmutableState` comes from `v4-periphery`.
-
-Upstream integration references: [v4 PoolManager implementation](https://github.com/Uniswap/v4-core/blob/bea7f6d1c11cd5dc4f0d5151ffa37a1c239feee6/src/PoolManager.sol), [v4 hook dispatch](https://github.com/Uniswap/v4-core/blob/bea7f6d1c11cd5dc4f0d5151ffa37a1c239feee6/src/libraries/Hooks.sol), and [BaseHook](https://github.com/Uniswap/v4-hooks-public/blob/82de6aa6de5c3e387fa5a088af6977f14f66e314/src/base/BaseHook.sol). Dependencies retain their own upstream licenses; see `lib/` and the lockfile.
+The execution-sample SMA is not a TWAP: eight swaps can change the whole feed in one block. Range-bounded orders remain exposed to sandwiching and adverse prices. Thin liquidity can leave capital idle; fees and the buyback do not guarantee positive returns. LPs retain minimum-output/deadline controls on basket entry/exit and should apply transaction-level slippage checks when wrapping receipts.
