@@ -46,23 +46,23 @@ The network's manifest step supplies `launch.json`; this project intentionally d
 
 Only `afterInitialize` and `afterSwap` are enabled. Each external callback inherits the PoolManager-only check. All return-delta permissions are disabled, and `afterSwap` returns its selector and zero. No callback blocks external LP additions, removals, or zero-liquidity fee collection, including during emergency mode.
 
-Initialization seeds all eight `int24` buffer entries with the launch tick, sets the circular write index to zero, and starts the cooldown. Every subsequent swap callback reads the **post-swap `slot0.tick`** from the bound pool, replaces one entry, advances the index modulo eight, and computes:
+Initialization seeds all eight `int24` buffer entries with the launch tick, sets the circular write index to zero, and starts the cooldown. Every subsequent swap callback reads the **post-swap `slot0.tick`** from the bound pool, replaces one entry, advances the index modulo eight, and computes the moments in **eighths of a tick**, so that no rounding of the mean leaks into the trigger or the band:
 
 ```text
-mean     = trunc_toward_zero(sum(ticks) / 8)
-variance = floor(sum((tick - mean)^2) / 8)    # population variance
-sigma    = floor(integer_sqrt(variance))
-lower    = floor_to_spacing(mean - 3*sigma)
-upper    = ceil_to_spacing(mean + 3*sigma)
+sum       = sum(ticks)                                  # exactly 8 * mean
+variance8 = floor(sum((8*tick - sum)^2) / 8)            # 64 * population variance
+sigma8    = floor(integer_sqrt(variance8))              # floor(8 * sigma)
+lower     = floor_to_spacing(floor((sum - 3*sigma8) / 8))   # mean - 3 sigma
+upper     = ceil_to_spacing(ceil((sum + 3*sigma8) / 8))     # mean + 3 sigma
 ```
 
-Intermediate arithmetic uses 256-bit integers. Negative lower bounds round toward negative infinity. Equal bounds, possible at zero volatility, widen by one spacing on each side. Otherwise a zero-volatility non-grid mean uses its two surrounding grid points. Bounds are clamped to v4's usable ticks, preserving at least one spacing at either extreme. `statistics()`, `ticks(index)`, `nextSample`, `proposedBands()`, `tickLower`, and `tickUpper` expose the calculation.
+Intermediate arithmetic uses 256-bit integers. Negative values round toward negative infinity. Equal bounds, possible at zero volatility, widen by one spacing on each side. Bounds are clamped to v4's usable ticks, preserving at least one spacing at either extreme. Because every sample lies within `sqrt(7)` sigma of the mean, the band always brackets the latest execution tick. `moments()` returns `(sum, sigma8)`; `statistics()` returns the whole-tick view `(mean rounded to nearest, half up; floor(sigma8 / 8))` for display and events. `ticks(index)`, `nextSample`, `proposedBands()`, `tickLower`, and `tickUpper` expose the rest.
 
 The callback rebalances precisely when all of these hold:
 
-- Emergency mode is inactive and shares exist.
+- Emergency mode is inactive and **external** shares exist: `totalSupply() > MINIMUM_SHARES`. The 1,000 locked shares alone never trigger a cycle after every holder has left.
 - `block.timestamp >= lastRebalance + 30 minutes`.
-- `2 * abs(activeTick - mean) > 3 * sigma`, using the **freshly updated** window. Equality does not trigger. With sigma zero, any nonzero deviation triggers once the cooldown expires.
+- `2 * abs(8*activeTick - sum) > 3 * sigma8`, i.e. `abs(activeTick - mean) > 1.5 sigma` with the exact mean, using the **freshly updated** window. Equality does not trigger. With seven samples at one tick and one a tick nearer zero, the resting tick does not trigger and the outlier does.
 
 This is an **eight-execution sample**, not a time-weighted oracle. Multiple swaps in a block can replace the whole window. The 30-minute condition limits rebalance frequency; it does not make the samples manipulation-resistant. That deliberate specification choice exposes LPs to adverse selection, MEV, and manipulated range selection. No guaranteed yield or protection from impermanent loss is implied.
 
@@ -73,12 +73,24 @@ The swap's PoolManager unlock is already active. The hook directly:
 1. Removes 100% of its old position using its fixed `POSITION_SALT`.
 2. Accounts for the returned principal **and all accrued LP fees**. `modifyLiquidity`'s caller delta already includes fees; the separate fee return is used only for reporting.
 3. Assigns the new bands from the fresh feed.
-4. Adds as much liquidity as its two token balances and the pool's remaining per-tick capacity support, with conservative integer rounding.
+4. **Balances the inventory to the band's ratio** with one exact-input swap in the same pool (see below), then adds as much liquidity as its two balances and the pool's remaining per-tick capacity support, with conservative integer rounding.
 5. Retains all unused balances for future cycles. The cooldown timestamp changes atomically with the successful cycle.
 
 Positive deltas are converted into ERC-6909 claims owned by the hook. Adding liquidity consumes those claims first, then uses any raw dust with `sync → transfer → settle` (or native settlement). Every hook delta is zero before returning to the swap router. This matters on a freshly funded, one-sided pool: the router has not paid its input during `afterSwap`, so taking raw principal there could fail even though the final swap is solvent. Claims defer that transfer while preserving full backing at unlock completion. Deposits, exits and emergency activation open their own authenticated unlocks; rebalances never nest an unlock.
 
-**Inventory assumption:** the vault does not execute balancing swaps or use an external venue. If the new range requires both tokens but inventory is mostly one-sided, only the supported portion can become LP liquidity. The remainder may be substantial, remains owned pro-rata by shareholders as raw assets or claims, and earns no LP fees until usable. This also applies when another LP fills either boundary's liquidity capacity. There is no trade at an assumed price to manufacture the missing side. `totalAssets()` includes this inventory, the position principal, and uncollected fees. No hook, performance, management, withdrawal, or keeper fee is charged.
+**Prepaying routers.** A router may pay its input before the swap (`sync`, transfer, `swap`, `settle`). The manager has a single synced-currency slot, so a hook that synced inside `afterSwap` would absorb that transfer and break the router's settlement. When the manager reports a synced currency at rebalance time, the cycle pays **from claims only** (`_budget` excludes raw balances) and raw dust waits for a cycle opened by a router that pays afterwards, or for the next deposit or withdrawal, which run in the hook's own unlock. A cycle never syncs while another contract's payment is pending.
+
+### The balancing trade
+
+A trend carries the price out of the old band, so the burn returns a single currency, while the new band, built from samples that include the current tick, always brackets the price and needs both. Without a trade the vault would stay one-sided for good (the reopened finding). Each cycle therefore sells the surplus side into its own pool:
+
+- The target split follows the band at the current sqrt price `p`: per unit of liquidity the range holds `(p − lower)` of currency1 and `(upper − p) · p / upper` of currency0 value, both in sqrt-price units, so the currency1 share of value is `(p − lower) · upper / p` over the sum of both weights (`VaultMath.targetAmount1`). Outside the band the price is clamped to the nearer edge, which yields a one-sided target.
+- The trade is skipped when the imbalance is below **`REBALANCE_SWAP_DEADBAND_BPS = 100`** (1% of vault value), or when the pool has **no active liquidity** (a swap would only displace the price).
+- It is an exact-input swap with a price limit at the band edge it moves towards, and never further than **`REBALANCE_SWAP_MAX_TICKS = 300`** (about 3%) from the current tick. The vault never trades outside the range it is about to supply. In a pool too thin to fill within that cap, the remainder stays idle and later cycles continue the conversion.
+- The PoolManager skips a hook's own callbacks for a swap the hook sends itself, so the trade records no sample and cannot recurse. Its output is minted as claims and its input is burned from claims, so it works inside the swapper's unlock before the router has paid.
+- The trade pays the pool's 1.25% LP fee to the other LPs and bears price impact up to the limit. Because a pending cycle is visible on chain (cooldown expired, deviation met), it can be sandwiched within the limit; the band edge and the tick cap bound that loss per cycle. This is the cost of meeting the specification's step 4 ("redeploy principal + fees into the new tight range") from a one-sided inventory. `InventoryBalanced(zeroForOne, amountIn, delta0, delta1)` reports every trade.
+
+Both constants are the implementer's choices for numbers the brief left open. When other LPs have filled either boundary's per-tick capacity, only the supported portion becomes liquidity. `totalAssets()` includes idle inventory, the position principal, and uncollected fees. No hook, performance, management, withdrawal, or keeper fee is charged.
 
 ## Deposits, shares and normal exits
 
@@ -86,7 +98,9 @@ Amounts always follow **currency0/currency1 order**, in the currencies' smallest
 
 `previewDeposit(amount0Max, amount1Max)` returns shares and required amounts at current state. `deposit(amount0Max, amount1Max, minShares, receiver, deadline)` requires a positive `minShares`, valid receiver and unexpired deadline. Approve the hook for the required ERC-20 amounts. In a native pool, send exactly `amount0Max` as `msg.value`; unused ETH is refunded to the caller. No ETH is accepted through this entry point for an ERC-20/WETH pool.
 
-On the first deposit, both maximum amounts are accepted, and the calculated initial liquidity determines share supply. Exactly **1,000 minimum share units** are permanently minted to the hook itself, with no recovery or redemption path, as an initial-share inflation mitigation. The depositor receives the remainder. Use a substantial first deposit and balanced budgets; tiny or unusable deposits revert. Direct donations before the first deposit accrue to this initial share supply.
+On the first deposit, the two budgets size the initial liquidity, which determines the share supply, and **only the rounded-up cost of that liquidity is pulled**: the unused side of an unbalanced budget stays with the depositor (an immediate exit loses rounding dust only). Exactly **1,000 minimum share units** are permanently minted to the hook itself, with no recovery or redemption path, as an initial-share inflation mitigation. The depositor receives the remainder. Use a substantial first deposit; tiny or unusable deposits revert. Direct donations before the first deposit accrue to this initial share supply.
+
+Whenever the vault holds no position (`liquidity == 0`: before the first deposit, or after every holder has left and a cycle found no capacity), `deposit` first **refreshes the band from the feed** (`BandRefreshed`), so a first deposit into a launch pool that has already traded invests around the current price rather than the launch tick. `previewDeposit` quotes against the stored band; in that state the stored band may be stale, so submit a `minShares` from a quote taken in the same block or compare with `proposedBands()`.
 
 Later deposits first harvest outstanding fees for existing holders, then mint the minimum of the two proportional share quotes, rounding shares down and required token contributions up. A side with zero holdings imposes no contribution. Principal is rounded up for deposit pricing, preventing rounding dilution. Only actual required ERC-20 amounts are pulled, and only from `msg.sender`. Deposits that would create zero shares or miss `minShares` revert atomically. Exact input balance checks reject transfer-tax tokens. Rebasing, taxed, blocked, or otherwise nonstandard pair tokens are unsupported; the factory must select the standard launch token and canonical WETH/native ETH.
 
@@ -100,13 +114,15 @@ Only `owner()` may call `activateEmergencyMode()`. It removes **all** vault liqu
 
 Anyone may call `emergencyWithdraw()` to burn **their own entire share balance**, or `emergencyWithdraw(shares, receiver)` for a partial redemption or different destination. Each receives `floor(rawBalance * shares / totalSupply)` of each asset. No PoolManager call, oracle, keeper, cooldown, or owner's further approval is needed. State updates and the share burn precede payments; a reentrancy guard covers all asset entry and exit paths. A recipient that rejects ETH can choose another receiver without losing shares, since failed transfers roll back.
 
-The owner can transfer ownership through the two-step `transferOwnership` / `acceptOwnership` flow. Renunciation is disabled to retain an emergency operator. There is no asset-sweep, manual price setter, manual range override, pool reassignment, upgrade, arbitrary external-call, or additional fee power. Accidental transfers of unrelated assets have no recovery function.
+The owner can transfer ownership through the two-step `transferOwnership` / `acceptOwnership` flow. Renunciation is disabled to retain an emergency operator. There is no asset-sweep, manual price setter, manual range override, pool reassignment, upgrade, arbitrary external-call, or additional fee power. Accidental transfers of unrelated assets have no recovery function. The hook's `receive()` accepts ETH only from the PoolManager, and only when currency0 is native: stray ETH sent to a WETH-paired vault is refused rather than locked.
 
 ## After launch
 
 No external-service setter is needed: manager, owner, token and factory are constructor-bound, and the factory's initialization binds the pool. Verify those values before accepting user deposits. For WETH, the launch operator must verify the other currency against the target chain's official deployment and token interface.
 
-The owner should use an operationally accessible, reviewed ownership arrangement, monitor `SampleRecorded`, `FeesCollected`, `Rebalanced`, and vault balances, and activate emergency mode on a strategy or integration failure. Watch one-sided idle balances, unexpected pool prices, liquidity at the range boundaries, failed swaps and the time since the last rebalance. A quiet pool produces no new samples or automatic cycles; no keeper can force a rebalance outside the specified trigger. Swappers pay the extra gas of triggered cycles.
+The owner should use an operationally accessible, reviewed ownership arrangement, monitor `SampleRecorded`, `FeesCollected`, `Rebalanced`, `InventoryBalanced`, `BandRefreshed` and vault balances, and activate emergency mode on a strategy or integration failure. Watch idle balances that persist across cycles (a pool too thin for the tick cap), unexpected pool prices, liquidity at the range boundaries, failed swaps and the time since the last rebalance. A quiet pool produces no new samples or automatic cycles; no keeper can force a rebalance outside the specified trigger. Swappers pay the extra gas of triggered cycles, including the balancing trade.
+
+Liquidity sizing divides by the small sqrt-price difference before multiplying by the large product, so very low prices (ticks below about −600,000) no longer lose up to half of the currency0 budget to an intermediate floored to a few units.
 
 The launch operator must verify Cancun compatibility, the actual manager implementation, fee configuration and atomic factory initialization, rehearse deposits/swaps/emergency exits on the target deployment, and arrange independent adversarial review before accepting public capital. Local tests use real v4 core code, but are not a fork rehearsal or an independent audit.
 

@@ -58,17 +58,21 @@ contract NativeVaultTest is Fixture {
     }
 
     function testFuzz_freshManagerRebalanceBeforeInputSettlement(bool exactOutput) public {
-        // With no liquidity, v4 moves to the price limit with zero token delta.
-        _moveTo(60);
-        _deposit(alice, 0, 10 ether); // price is at the upper boundary: entirely token1.
-        assertEq(address(manager).balance, 0);
-        assertEq(address(hook).balance, 0);
+        _deposit(alice, 10 ether, 10 ether);
+        // A buyer takes every wei of ETH the vault's position held: the manager is left with none.
+        _moveTo(200);
+        // Settle the feed at this level: with no liquidity up here the dust swaps fill nothing.
+        for (uint256 i; i < 7; ++i) {
+            router.swap(key, i % 2 == 0, -1, TickMath.getSqrtPriceAtTick(i % 2 == 0 ? int24(199) : int24(200)));
+        }
+        assertLe(address(manager).balance, 1); // rounding dust at most: nothing a take could draw on.
         uint256 initialTime = hook.lastRebalance();
         vm.warp(initialTime + 30 minutes);
         router.swap(key, true, exactOutput ? int256(9 ether) : -int256(100 ether), TickMath.getSqrtPriceAtTick(-50));
         assertEq(hook.lastRebalance(), block.timestamp);
         assertTrue(router.hookDeltasWereZero());
         assertGt(address(manager).balance, 0); // router paid only after the callback completed.
+        assertGt(hook.liquidity(), 0);
         (uint256 assets0, uint256 assets1) = hook.totalAssets();
         assertGt(assets0 + assets1, 9 ether);
         _assertPositionMatches();
@@ -96,7 +100,11 @@ contract NativeVaultTest is Fixture {
         _deposit(alice, 10 ether, 10 ether);
         vm.warp(hook.lastRebalance() + 30 minutes);
         _moveTo(-300);
-        assertGt(manager.balanceOf(address(hook), key.currency0.toId()), 0);
+        assertGt(
+            manager.balanceOf(address(hook), key.currency0.toId())
+                + manager.balanceOf(address(hook), key.currency1.toId()),
+            0
+        );
         vm.prank(owner);
         hook.activateEmergencyMode();
         assertGt(address(hook).balance, 0);
@@ -122,6 +130,18 @@ contract NativeVaultTest is Fixture {
         assertEq(receiver.refusal(), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
         assertEq(hook.balanceOf(address(receiver)), 0);
         assertLe(address(receiver).balance, 10 ether);
+    }
+
+    function test_onlyTheManagerMaySendEthToTheHook() public {
+        vm.prank(alice);
+        (bool ok,) = address(hook).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(address(hook).balance, 0);
+        vm.deal(address(manager), 1 ether);
+        vm.prank(address(manager));
+        (ok,) = address(hook).call{value: 1 ether}("");
+        assertTrue(ok);
+        assertEq(address(hook).balance, 1 ether);
     }
 
     function test_rejectingEthRecipientRollsBackAndCanChooseAnotherReceiver() public {

@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Fixture} from "./helpers/Fixture.sol";
 import {SigmaHook} from "../src/SigmaHook.sol";
 import {HookFlags} from "../src/HookFlags.sol";
+import {VaultMath} from "../src/libraries/VaultMath.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -230,10 +231,162 @@ contract SigmaHookTest is Fixture {
         _assertPositionMatches();
         (uint256 a0, uint256 a1) = hook.totalAssets();
         assertGt(a0 + a1, 19 ether);
-        assertGt(manager.balanceOf(address(hook), key.currency1.toId()), 0);
+        assertGt(hook.liquidity(), 0);
         assertTrue(router.hookDeltasWereZero());
         assertEq(manager.getNonzeroDeltaCount(), 0);
         assertFalse(manager.isUnlocked());
+    }
+
+    /// A trend carries the price out of the band, so the burn returns a single currency. The cycle
+    /// sells the surplus to the band's ratio and redeploys; later cycles keep doing so.
+    function test_trendRebalanceSellsSurplusAndRedeploys() public {
+        _seedBackground();
+        _deposit(alice, 1_000 ether, 1_000 ether);
+        uint256 t = block.timestamp + 31 minutes;
+        vm.warp(t);
+        _moveTo(2000);
+        assertEq(hook.lastRebalance(), t);
+        assertGt(hook.liquidity(), 0, "capital redeployed on the trend cycle");
+        assertTrue(router.hookDeltasWereZero());
+        _assertPositionMatches();
+        assertLe(hook.tickLower(), 2000);
+        assertGe(hook.tickUpper(), 2000);
+        for (uint256 i; i < 4; ++i) {
+            for (uint256 j; j < 8; ++j) {
+                router.swap(key, true, -1000, TickMath.MIN_SQRT_PRICE + 1);
+            }
+            t += 31 minutes;
+            vm.warp(t);
+            _moveTo(i % 2 == 0 ? int24(-1500) : int24(1500));
+            assertEq(hook.lastRebalance(), t);
+            assertGt(hook.liquidity(), 0, "capital redeployed on a later cycle");
+            assertTrue(router.hookDeltasWereZero());
+            _assertPositionMatches();
+        }
+    }
+
+    /// In a pool deep enough for the balancing trade to fill within the tick cap, a trend cycle
+    /// leaves only a small idle remainder: the rest of the vault's value is in the new band.
+    function test_deepPoolTrendRebalanceDeploysMostCapital() public {
+        router.modify(key, -887220, 887220, 20_000 ether);
+        _deposit(alice, 1_000 ether, 1_000 ether);
+        vm.warp(block.timestamp + 31 minutes);
+        _moveTo(2000);
+        assertEq(hook.lastRebalance(), block.timestamp);
+        assertGt(hook.liquidity(), 0);
+        (uint160 price, int24 tick,,) = manager.getSlot0(key.toId());
+        assertGe(tick, 2000);
+        assertLe(tick, 2000 + hook.REBALANCE_SWAP_MAX_TICKS());
+        (uint256 a0, uint256 a1) = hook.totalAssets();
+        uint256 idle0 = _balance(key.currency0, address(hook)) + manager.balanceOf(address(hook), key.currency0.toId());
+        uint256 idle1 = _balance(key.currency1, address(hook)) + manager.balanceOf(address(hook), key.currency1.toId());
+        uint256 idleValue = VaultMath.valueInCurrency1(idle0, price) + idle1;
+        uint256 totalValue = VaultMath.valueInCurrency1(a0, price) + a1;
+        assertLe(idleValue * 10, totalValue, "at most a tenth of the vault's value idle");
+        assertGt(totalValue, 1_900 ether, "value kept through the trade");
+        assertTrue(router.hookDeltasWereZero());
+        _assertPositionMatches();
+    }
+
+    /// The balancing trade is an ordinary swap by the hook: it pays the LP fee and stops at the band
+    /// edge or the tick cap, never beyond, and the vault keeps all its value in both currencies.
+    function test_balancingTradeStaysInsideBandAndCap() public {
+        _seedBackground();
+        _deposit(alice, 1_000 ether, 1_000 ether);
+        vm.warp(block.timestamp + 31 minutes);
+        _moveTo(2000);
+        (, int24 tick,,) = manager.getSlot0(key.toId());
+        assertLe(tick, hook.tickUpper());
+        assertGe(tick, hook.tickLower());
+        assertLe(tick, 2000 + hook.REBALANCE_SWAP_MAX_TICKS());
+        assertGe(tick, 2000 - hook.REBALANCE_SWAP_MAX_TICKS());
+        (uint256 a0, uint256 a1) = hook.totalAssets();
+        assertGt(a0, 0);
+        assertGt(a1, 0);
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+    }
+
+    /// Without other liquidity a swap would only displace the price, so the cycle invests as is.
+    function test_noBalancingTradeInAnEmptyPool() public {
+        _deposit(alice, 10 ether, 10 ether);
+        vm.warp(block.timestamp + 30 minutes);
+        _moveTo(20);
+        assertEq(hook.lastRebalance(), block.timestamp);
+        (, int24 tick,,) = manager.getSlot0(key.toId());
+        assertEq(tick, 20);
+        assertGt(hook.liquidity(), 0);
+    }
+
+    function test_firstDepositPullsOnlyWhatTheBandNeeds() public {
+        (uint256 quote, uint256 need0, uint256 need1) = hook.previewDeposit(1 ether, 10);
+        assertGt(quote, 0);
+        assertLe(need0, 20);
+        assertEq(need1, 10);
+        uint256 before0 = _balance(key.currency0, alice);
+        uint256 before1 = _balance(key.currency1, alice);
+        vm.prank(alice);
+        (uint256 shares, uint256 used0, uint256 used1) = hook.deposit(1 ether, 10, 1, alice, block.timestamp);
+        assertEq(shares, quote);
+        assertEq(used0, need0);
+        assertEq(used1, need1);
+        assertEq(before0 - _balance(key.currency0, alice), used0);
+        assertEq(before1 - _balance(key.currency1, alice), used1);
+        vm.prank(alice);
+        hook.withdraw(shares, 0, 0, alice, block.timestamp);
+        assertLe(before0 - _balance(key.currency0, alice), 20);
+        assertLe(before1 - _balance(key.currency1, alice), 20);
+    }
+
+    /// Launch pools trade before anyone deposits: the first deposit must invest around the current
+    /// price, not the launch tick's band.
+    function test_firstDepositAfterPriceMoveUsesFreshBand() public {
+        _seedBackground();
+        _moveTo(3000);
+        assertEq(hook.tickLower(), -60);
+        assertEq(hook.tickUpper(), 60);
+        (int24 proposedLower, int24 proposedUpper) = hook.proposedBands();
+        (uint256 quote, uint256 need0, uint256 need1) = hook.previewDeposit(10 ether, 10 ether);
+        vm.prank(alice);
+        (uint256 shares, uint256 used0, uint256 used1) = hook.deposit(10 ether, 10 ether, 1, alice, block.timestamp);
+        assertEq(hook.tickLower(), proposedLower);
+        assertEq(hook.tickUpper(), proposedUpper);
+        assertLe(proposedLower, 3000);
+        assertGe(proposedUpper, 3000);
+        assertGt(used0, 0);
+        assertGt(used1, 0);
+        assertGt(hook.liquidity(), 0);
+        _assertPositionMatches();
+        // The quote was taken against the stale band and the deposit against the fresh one.
+        assertTrue(shares != quote || used0 != need0 || used1 != need1);
+        // Idle inventory is only the unused side's remainder.
+        (uint256 a0, uint256 a1) = hook.totalAssets();
+        assertLe(_balance(key.currency0, address(hook)) * 100, a0 + 100);
+        assertLe(_balance(key.currency1, address(hook)) * 100, a1 + 100);
+    }
+
+    function test_emptiedVaultDoesNotRebalanceUntilSomeoneDepositsAgain() public {
+        _seedBackground();
+        uint256 shares = _deposit(alice, 10 ether, 10 ether);
+        vm.prank(alice);
+        hook.withdraw(shares, 0, 0, alice, block.timestamp);
+        assertEq(hook.totalSupply(), hook.MINIMUM_SHARES());
+        uint256 initialTime = hook.lastRebalance();
+        vm.warp(initialTime + 30 minutes);
+        _moveTo(600);
+        assertEq(hook.lastRebalance(), initialTime);
+        _deposit(bob, 10 ether, 10 ether);
+        vm.warp(block.timestamp + 30 minutes);
+        _moveTo(1200);
+        assertEq(hook.lastRebalance(), block.timestamp);
+    }
+
+    function test_strayEthIsRefusedOnAnErc20Pair() public {
+        (bool ok,) = address(hook).call{value: 1 ether}("");
+        assertFalse(ok);
+        vm.prank(address(manager));
+        (ok,) = address(hook).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(address(hook).balance, 0);
     }
 
     function test_rebalanceCompoundsAllAccruedFeesAndDust() public {
@@ -348,14 +501,17 @@ contract SigmaHookTest is Fixture {
     function testFuzz_roundTripNeverCreatesAssets(uint96 amount0, uint96 amount1) public {
         amount0 = uint96(bound(amount0, 1e6, 100 ether));
         amount1 = uint96(bound(amount1, 1e6, 100 ether));
-        uint256 shares = _deposit(alice, amount0, amount1);
+        vm.prank(alice);
+        (uint256 shares, uint256 used0, uint256 used1) = hook.deposit(amount0, amount1, 1, alice, block.timestamp);
+        assertLe(used0, amount0);
+        assertLe(used1, amount1);
         vm.prank(alice);
         (uint256 paid0, uint256 paid1) = hook.withdraw(shares, 0, 0, alice, block.timestamp);
-        assertLe(paid0, amount0);
-        assertLe(paid1, amount1);
+        assertLe(paid0, used0);
+        assertLe(paid1, used1);
         (uint256 remaining0, uint256 remaining1) = hook.totalAssets();
-        assertApproxEqAbs(paid0 + remaining0, amount0, 2);
-        assertApproxEqAbs(paid1 + remaining1, amount1, 2);
+        assertApproxEqAbs(paid0 + remaining0, used0, 2);
+        assertApproxEqAbs(paid1 + remaining1, used1, 2);
         _assertPositionMatches();
     }
 

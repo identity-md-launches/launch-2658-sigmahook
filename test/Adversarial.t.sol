@@ -6,9 +6,12 @@ import {TaxToken, MockERC20} from "./helpers/MockERC20.sol";
 import {SigmaHook} from "../src/SigmaHook.sol";
 import {MineSalt} from "../script/MineSalt.s.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {Pool} from "v4-core/src/libraries/Pool.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
@@ -35,6 +38,38 @@ contract CallbackToken is MockERC20 {
         succeeded = ok;
         refusal = bytes4(reason);
         return super.transferFrom(from, to, value);
+    }
+}
+
+/// @dev A router that pays its input before the swap: sync, transfer, swap, settle. Valid in v4, and
+/// broken by any hook that syncs a currency of its own inside afterSwap.
+contract PrepayRouter is IUnlockCallback {
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    function swapExactIn(PoolKey memory key, bool zeroForOne, uint256 amountIn, uint160 limit) external {
+        manager.unlock(abi.encode(key, zeroForOne, amountIn, limit));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory key, bool zeroForOne, uint256 amountIn, uint160 limit) =
+            abi.decode(data, (PoolKey, bool, uint256, uint160));
+        Currency input = zeroForOne ? key.currency0 : key.currency1;
+        Currency output = zeroForOne ? key.currency1 : key.currency0;
+        manager.sync(input);
+        input.transfer(address(manager), amountIn);
+        BalanceDelta delta = manager.swap(key, SwapParams(zeroForOne, -int256(amountIn), limit), "");
+        uint256 paid = manager.settle();
+        require(paid == amountIn, "prepayment lost");
+        int128 owed = zeroForOne ? delta.amount0() : delta.amount1();
+        if (uint256(uint128(-owed)) < amountIn) manager.take(input, address(this), amountIn - uint256(uint128(-owed)));
+        int128 received = zeroForOne ? delta.amount1() : delta.amount0();
+        if (received > 0) manager.take(output, address(this), uint128(received));
+        return "";
     }
 }
 
@@ -129,6 +164,33 @@ contract AdversarialTest is Fixture {
             assertEq(manager.currencyDelta(address(other), otherKey.currency0), 0);
             assertEq(manager.currencyDelta(address(other), otherKey.currency1), 0);
         }
+    }
+
+    /// A rebalance inside a prepaying router's unlock must not sync: it pays from claims only and
+    /// leaves raw dust for a cycle opened by a router that pays afterwards.
+    function test_prepayRouterSwapSurvivesARebalance() public {
+        _seedBackground();
+        _deposit(alice, 10 ether, 10 ether);
+        vm.startPrank(alice);
+        IERC20(Currency.unwrap(key.currency0)).transfer(address(hook), 1 ether);
+        IERC20(Currency.unwrap(key.currency1)).transfer(address(hook), 1 ether);
+        vm.stopPrank();
+        PrepayRouter prepay = new PrepayRouter(manager);
+        token.transfer(address(prepay), 100 ether);
+        weth.mint(address(prepay), 100 ether);
+        vm.warp(hook.lastRebalance() + 30 minutes);
+        prepay.swapExactIn(key, true, 5 ether, TickMath.getSqrtPriceAtTick(-600));
+        assertEq(hook.lastRebalance(), block.timestamp);
+        assertGt(hook.liquidity(), 0);
+        assertEq(_balance(key.currency0, address(hook)), 1 ether, "raw dust untouched by a claims-only cycle");
+        assertEq(_balance(key.currency1, address(hook)), 1 ether);
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        // The next cycle, opened by a router that pays after the swap, deploys the dust too.
+        vm.warp(hook.lastRebalance() + 30 minutes);
+        _moveTo(600);
+        assertEq(hook.lastRebalance(), block.timestamp);
+        assertLt(_balance(key.currency0, address(hook)) + _balance(key.currency1, address(hook)), 2 ether);
+        assertTrue(router.hookDeltasWereZero());
     }
 
     function test_emptyVaultCanEnterEmergency() public {
