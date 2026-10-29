@@ -1,0 +1,29 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "SigmaHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$owner",
+      "$token",
+      "$factory"
+    ],
+    "permissions": [
+      "afterInitialize",
+      "afterSwap"
+    ]
+  },
+  "token": {
+    "contract": "SigmaToken",
+    "name": "SigmaHook",
+    "symbol": "SHK",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SigmaHook is a BaseHook auto-vault for the SHK/native ETH pool. Constructor order is (IPoolManager manager_, address owner_, address launchToken_, address factory_). afterInitialize accepts only the launch factory as sender, a single initialization, the 12500 LP fee, tickSpacing 60 and a key containing the launch token; it seeds the 8-slot tick buffer with the launch tick. afterSwap records the slot0 tick into the circular buffer, computes SMA and integer-sqrt standard deviation, and when at least 30 minutes have passed since the last rebalance and the tick deviates from the SMA by more than 1.5 sigma, burns all vault liquidity, collects principal and fees, and redeploys into SMA +/- 3 sigma rounded to tickSpacing, keeping dust for the next cycle. It returns no delta. LPs hold ERC-20 vault shares (svSHK). The owner (Ownable2Step) can activateEmergencyMode, which burns all liquidity to raw tokens in the hook; emergencyWithdraw then lets any share holder redeem pro-rata raw tokens."
+}
