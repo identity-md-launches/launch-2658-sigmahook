@@ -123,10 +123,13 @@ contract AccountingHandler is Test {
         if (beforePrice != TickMath.getSqrtPriceAtTick(target)) {
             (, int24 actualTick,,) = manager.getSlot0(key.toId());
             executionTick[sampleCount++] = actualTick;
-            (int24 mean, uint256 sigma) = vault.statistics();
-            uint256 distance =
-                actualTick >= mean ? uint256(int256(actualTick) - mean) : uint256(int256(mean) - actualTick);
-            bool due = !emergencySeen && block.timestamp >= previousRebalance + 30 minutes && 2 * distance > 3 * sigma;
+            // The trigger compares against the exact mean: |tick - sum / 8| > 1.5 sigma8 / 8.
+            (int256 sum, uint256 sigma8) = vault.moments();
+            int256 offset = int256(actualTick) * 8 - sum;
+            uint256 distance = uint256(offset < 0 ? -offset : offset);
+            // Only external holders justify a cycle; the locked minimum shares alone never do.
+            bool due = !emergencySeen && vault.totalSupply() > vault.MINIMUM_SHARES()
+                && block.timestamp >= previousRebalance + 30 minutes && 2 * distance > 3 * sigma8;
             assertEq(vault.lastRebalance(), due ? block.timestamp : previousRebalance, "wrong rebalance trigger");
         } else {
             assertEq(vault.lastRebalance(), previousRebalance);

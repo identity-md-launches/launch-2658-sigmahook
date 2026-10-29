@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Fixture} from "./helpers/Fixture.sol";
 import {TestRouter} from "./helpers/TestRouter.sol";
 import {SigmaToken} from "src/SigmaToken.sol";
+import {SigmaHook} from "src/SigmaHook.sol";
 import {WETH} from "solmate/src/tokens/WETH.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -48,20 +49,86 @@ contract WethVaultIntegrationTest is Fixture {
         }
     }
 
-    function test_emptyCurrency0ReserveExactInputRebalance() public {
-        _coldManagerSwap(true, false);
+    function test_priceAboveLaunchSoleVaultReserveExactInputRebalance() public {
+        _soleVaultSwap(true, false);
     }
 
-    function test_emptyCurrency0ReserveExactOutputRebalance() public {
-        _coldManagerSwap(true, true);
+    function test_priceAboveLaunchSoleVaultReserveExactOutputRebalance() public {
+        _soleVaultSwap(true, true);
     }
 
-    function test_emptyCurrency1ReserveExactInputRebalance() public {
-        _coldManagerSwap(false, false);
+    function test_priceBelowLaunchSoleVaultReserveExactInputRebalance() public {
+        _soleVaultSwap(false, false);
     }
 
-    function test_emptyCurrency1ReserveExactOutputRebalance() public {
-        _coldManagerSwap(false, true);
+    function test_priceBelowLaunchSoleVaultReserveExactOutputRebalance() public {
+        _soleVaultSwap(false, true);
+    }
+
+    /// @dev Each sample lies within sqrt(7) sigma of the mean, so a band refreshed from the feed always
+    /// contains the moved price: the first deposit after an empty-pool move must bring both tokens.
+    function test_firstDepositAfterEmptyPoolMoveRecentresBandOnFeed() public {
+        _moveTo(60);
+        (int24 lower, int24 upper) = hook.proposedBands();
+        assertLt(lower, 60);
+        assertGt(upper, 60);
+        // previewDeposit still quotes the stored band here; see the preview finding in .imd-findings.json.
+        vm.prank(alice);
+        vm.expectRevert(SigmaHook.Slippage.selector);
+        hook.deposit(0, 10 ether, 1, alice, block.timestamp);
+        assertEq(hook.tickLower(), -60, "failed deposit must not keep the refreshed band");
+        assertEq(hook.tickUpper(), 60);
+        uint256 before0 = key.currency0.balanceOf(alice);
+        uint256 before1 = key.currency1.balanceOf(alice);
+        vm.prank(alice);
+        (uint256 shares, uint256 paid0, uint256 paid1) = hook.deposit(10 ether, 10 ether, 1, alice, block.timestamp);
+        assertGt(shares, 0);
+        assertEq(hook.tickLower(), lower);
+        assertEq(hook.tickUpper(), upper);
+        assertGt(paid0, 0);
+        assertGt(paid1, 0);
+        // Only what the minted liquidity costs leaves the depositor; the unused budget stays.
+        assertEq(before0 - key.currency0.balanceOf(alice), paid0);
+        assertEq(before1 - key.currency1.balanceOf(alice), paid1);
+        assertTrue(paid0 < 10 ether || paid1 < 10 ether);
+        assertEq(key.currency0.balanceOf(address(manager)), paid0);
+        assertEq(key.currency1.balanceOf(address(manager)), paid1);
+        _assertPositionMatches();
+    }
+
+    function _soleVaultSwap(bool fromAbove, bool exactOutput) private {
+        // An empty pool can move to the limit without moving tokens, so every token the manager
+        // holds afterwards is the vault's own deposit, refreshed around the moved price.
+        _moveTo(fromAbove ? int24(60) : int24(-60));
+        vm.prank(alice);
+        (uint256 shares, uint256 paid0, uint256 paid1) = hook.deposit(10 ether, 10 ether, 1, alice, block.timestamp);
+        assertEq(key.currency0.balanceOf(address(manager)), paid0);
+        assertEq(key.currency1.balanceOf(address(manager)), paid1);
+        vm.warp(hook.lastRebalance() + 30 minutes);
+        BalanceDelta delta = router.swap(
+            key,
+            fromAbove,
+            // Asking for the whole output reserve stops the swap at its limit, inside the band.
+            exactOutput ? int256(fromAbove ? paid1 : paid0) : -int256(100 ether),
+            TickMath.getSqrtPriceAtTick(fromAbove ? int24(-50) : int24(50))
+        );
+        assertEq(hook.lastRebalance(), block.timestamp, "swap must trigger the rebalance");
+        assertTrue(router.hookDeltasWereZero(), "hook must settle before router input arrives");
+        assertEq(hook.totalSupply(), shares + hook.MINIMUM_SHARES(), "swap changed share ownership");
+        _assertPositionMatches();
+        assertEq(key.currency0.balanceOf(address(manager)), uint256(int256(paid0) - int256(delta.amount0())));
+        assertEq(key.currency1.balanceOf(address(manager)), uint256(int256(paid1) - int256(delta.amount1())));
+        (uint256 assets0, uint256 assets1) = hook.totalAssets();
+        assertApproxEqAbs(assets0, uint256(int256(paid0) - int256(delta.amount0())), 4);
+        assertApproxEqAbs(assets1, uint256(int256(paid1) - int256(delta.amount1())), 4);
+        assertEq(wrapped.totalSupply(), address(wrapped).balance, "WETH backing changed");
+        vm.prank(owner);
+        hook.activateEmergencyMode();
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), 0);
+        assertEq(manager.balanceOf(address(hook), key.currency1.toId()), 0);
+        vm.prank(alice);
+        hook.emergencyWithdraw();
+        assertEq(hook.balanceOf(alice), 0);
     }
 
     function test_emergencyReturnsWrappedEtherToChosenReceiverWithoutUnwrapping() public {

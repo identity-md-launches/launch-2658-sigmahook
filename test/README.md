@@ -8,8 +8,8 @@ environment mutation, or production deployment address is needed.
 | --- | --- |
 | `VaultAccountingInvariant.t.sol` | Three actors, 256 random sequences of 64 calls, deposits to other receivers, partial/full withdrawals, delegated share transfers, raw donations, fee donations, both swap modes, cooldown/rebalance decisions, and irreversible emergency exits. |
 | `VaultFailurePaths.t.sol` | Exact errors and state rollback after second-token pull failures, fee harvesting followed by slippage, withdrawal minima, oversized budgets, invalid receivers, invalid pool initialization, and ownership transitions. |
-| `WethVaultIntegration.t.sol` | ETH-backed WETH, both trade directions with exact input/output, zero initial input-token reserves, rebalance settlement before router funding, and emergency payouts in wrapped tokens. |
-| `MathProperties.t.sol` | Six properties with 1,000 inputs each: statistical symmetries, known distributions, minimal outward band rounding, strict trigger boundaries, principal rounding/price monotonicity, and budget monotonicity. Explicit zero and one-unit cases supplement them. |
+| `WethVaultIntegration.t.sol` | ETH-backed WETH; a sole-vault pool rebalancing in both directions with exact input and output after an empty-pool price move; manager balances matching the deposit minus swap cash flows exactly; settlement before router funding; a first deposit re-centred on the feed (one-sided basket refused, failed deposit leaves the band unchanged, only the cost is pulled); emergency payouts in wrapped tokens. |
+| `MathProperties.t.sol` | Six properties with 1,000 inputs each over the exact moments (`sum` = 8 × mean, `sigma8` = ⌊8σ⌋): order and reflection symmetry, nearest-tick rounding of the whole-tick view, known distributions, minimal outward band rounding from the unrounded mean, strict 1.5σ trigger boundaries, principal rounding and price monotonicity, and budget monotonicity. Pinned cases: an unrounded-mean trigger case, zero, and one base unit. |
 
 ## Independent accounting model
 
@@ -23,6 +23,8 @@ After every action:
   four base units per accounting action, allowing only integer rounding from principal and fees.
 - Each actor's shares and total supply must match a separate mint/burn/transfer ledger.
 - The circular feed must match an append-only history of actual post-swap `slot0` ticks.
+- A rebalance fires exactly when the cooldown has passed, emergency mode is off, shares other than the
+  locked minimum exist, and 2·|8·tick − sum| > 3·sigma8 (the unrounded 1.5σ test).
 - Emergency activation must remain permanent, with no liquidity or claims left in the manager.
 
 The bounded tick domain is [-600, 600], and budgets include zero through five tokens. Fees, raw
@@ -49,13 +51,18 @@ Run counts are embedded in the new test source. For builds restricted to the tes
 `--out test/scratch/out --cache-path test/scratch/cache` to either command. No delivered test imports
 anything from `test/scratch/` or `.imd/reads/`.
 
-## Confirmed limitation
+## Reported defect
 
-A separate defect report in `.imd-findings.json` includes a self-contained failing Foundry proof:
-at tick -658620, a 1,000-token currency0 deposit with one base unit of currency1 leaves approximately
-496.626 currency0 tokens idle despite sufficient counterpart tokens and tick capacity. Early rounding
-in `VaultMath.liquidityForAmounts` causes this. The passing suite does not assert that this behavior
-is correct; the failing proof is supplied with the report for the implementation author.
+`.imd-findings.json` reports one medium defect, with a self-contained proof that fails on the current
+code. While the vault holds no position, `deposit()` refreshes the band from the feed before quoting,
+but `previewDeposit()` quotes against the stored band. After the price moves on an empty pool, the
+preview offers shares for a basket that `deposit()` then refuses with `Slippage()`. The delivered
+suite does not assert the preview in that state. The invariant handler compares preview and deposit
+only while the vault holds a position.
+
+The earlier low-tick rounding report (tick -658620) was addressed in the revised
+`VaultMath.liquidityForAmounts` and is covered by the implementation's own `BandMath.t.sol`, so it is
+no longer reported.
 
 No live-chain fork was requested or configured. These offline integrations do not establish behavior
 against a particular deployed manager/WETH pair; a chain-specific launch rehearsal remains outside
