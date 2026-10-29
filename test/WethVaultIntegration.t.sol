@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Fixture} from "./helpers/Fixture.sol";
+import {TestRouter} from "./helpers/TestRouter.sol";
+import {SigmaToken} from "src/SigmaToken.sol";
+import {WETH} from "solmate/src/tokens/WETH.sol";
+import {PoolManager} from "v4-core/src/PoolManager.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+
+/// @dev Uses actual ETH-backed WETH and the vendored PoolManager; no RPC or token storage edits.
+contract WethVaultIntegrationTest is Fixture {
+    using StateLibrary for IPoolManager;
+
+    WETH private wrapped;
+
+    function setUp() public {
+        alice = makeAddr("weth-alice");
+        bob = makeAddr("weth-bob");
+        owner = makeAddr("weth-owner");
+        manager = IPoolManager(address(new PoolManager(owner)));
+        token = new SigmaToken();
+        wrapped = new WETH();
+        hook = _deployHook(address(token));
+        (address a, address b) =
+            address(token) < address(wrapped) ? (address(token), address(wrapped)) : (address(wrapped), address(token));
+        key = PoolKey(Currency.wrap(a), Currency.wrap(b), 12_500, 60, IHooks(address(hook)));
+        manager.initialize(key, 1 << 96);
+        router = new TestRouter(manager);
+        token.transfer(address(router), 1_000_000 ether);
+        vm.deal(address(this), 1_000_000 ether);
+        wrapped.deposit{value: 1_000_000 ether}();
+        wrapped.transfer(address(router), 900_000 ether);
+        for (uint256 i; i < 2; ++i) {
+            address actor = i == 0 ? alice : bob;
+            token.transfer(actor, 10_000 ether);
+            wrapped.transfer(actor, 10_000 ether);
+            vm.startPrank(actor);
+            token.approve(address(hook), type(uint256).max);
+            wrapped.approve(address(hook), type(uint256).max);
+            vm.stopPrank();
+        }
+    }
+
+    function test_emptyCurrency0ReserveExactInputRebalance() public {
+        _coldManagerSwap(true, false);
+    }
+
+    function test_emptyCurrency0ReserveExactOutputRebalance() public {
+        _coldManagerSwap(true, true);
+    }
+
+    function test_emptyCurrency1ReserveExactInputRebalance() public {
+        _coldManagerSwap(false, false);
+    }
+
+    function test_emptyCurrency1ReserveExactOutputRebalance() public {
+        _coldManagerSwap(false, true);
+    }
+
+    function test_emergencyReturnsWrappedEtherToChosenReceiverWithoutUnwrapping() public {
+        uint256 shares = _deposit(alice, 10 ether, 10 ether);
+        router.donate(key, 2 ether, 3 ether);
+        vm.prank(owner);
+        hook.activateEmergencyMode();
+        uint256 beforeWrapped = wrapped.balanceOf(bob);
+        uint256 beforeLaunch = token.balanceOf(bob);
+        uint256 beforeEth = bob.balance;
+        uint256 beforeBacking = address(wrapped).balance;
+        uint256 beforeSupply = wrapped.totalSupply();
+        vm.prank(alice);
+        (uint256 amount0, uint256 amount1) = hook.emergencyWithdraw(shares, bob);
+        uint256 expectedWeth = Currency.unwrap(key.currency0) == address(wrapped) ? amount0 : amount1;
+        uint256 expectedToken = Currency.unwrap(key.currency0) == address(token) ? amount0 : amount1;
+        assertGt(expectedWeth, 10 ether);
+        assertEq(wrapped.balanceOf(bob) - beforeWrapped, expectedWeth);
+        assertEq(token.balanceOf(bob) - beforeLaunch, expectedToken);
+        assertEq(bob.balance, beforeEth);
+        assertEq(address(wrapped).balance, beforeBacking);
+        assertEq(wrapped.totalSupply(), beforeSupply);
+        assertEq(hook.balanceOf(alice), 0);
+    }
+
+    function _coldManagerSwap(bool token1Only, bool exactOutput) private {
+        // An empty pool can move to the limit without moving tokens. The first LP then seeds
+        // just the output asset, leaving the next swap's input currency completely unfunded.
+        _moveTo(token1Only ? int24(60) : int24(-60));
+        uint256 seed0 = token1Only ? 0 : 10 ether;
+        uint256 seed1 = token1Only ? 10 ether : 0;
+        uint256 shares = _deposit(alice, seed0, seed1);
+        Currency input = token1Only ? key.currency0 : key.currency1;
+        assertEq(input.balanceOf(address(manager)), 0);
+        assertEq(input.balanceOf(address(hook)), 0);
+        vm.warp(hook.lastRebalance() + 30 minutes);
+        BalanceDelta delta = router.swap(
+            key,
+            token1Only,
+            exactOutput ? int256(9 ether) : -int256(100 ether),
+            TickMath.getSqrtPriceAtTick(token1Only ? int24(-50) : int24(50))
+        );
+        assertEq(hook.lastRebalance(), block.timestamp, "swap must trigger the rebalance");
+        assertTrue(router.hookDeltasWereZero(), "hook must settle before router input arrives");
+        assertGt(input.balanceOf(address(manager)), 0);
+        assertEq(hook.totalSupply(), shares + hook.MINIMUM_SHARES(), "swap changed share ownership");
+        (uint128 oldLiquidity,,) = manager.getPositionInfo(key.toId(), address(hook), -60, 60, hook.POSITION_SALT());
+        // If the new bands happen to equal the old bands, the position can have been redeployed there.
+        if (hook.tickLower() != -60 || hook.tickUpper() != 60) assertEq(oldLiquidity, 0);
+        _assertPositionMatches();
+        (uint256 assets0, uint256 assets1) = hook.totalAssets();
+        assertApproxEqAbs(assets0, uint256(int256(seed0) - int256(delta.amount0())), 4);
+        assertApproxEqAbs(assets1, uint256(int256(seed1) - int256(delta.amount1())), 4);
+        assertEq(wrapped.totalSupply(), address(wrapped).balance, "WETH backing changed");
+        vm.prank(owner);
+        hook.activateEmergencyMode();
+        assertEq(manager.balanceOf(address(hook), key.currency0.toId()), 0);
+        assertEq(manager.balanceOf(address(hook), key.currency1.toId()), 0);
+        vm.prank(alice);
+        hook.emergencyWithdraw();
+        assertEq(hook.balanceOf(alice), 0);
+    }
+}
